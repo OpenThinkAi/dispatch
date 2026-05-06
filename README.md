@@ -136,8 +136,9 @@ can_label = true
 
 **First-run behavior:** when dispatch sees a repo for the first time, it
 seeds the cursor to *now* and ingests *nothing* historical. To backfill,
-delete the relevant entries from `cursors.json` (or the whole file) and
-run `dispatch poll`.
+edit `cursors.json` and write an *older* timestamp for the slug, then
+run `dispatch poll`. (Just deleting the entry re-seeds it forward — the
+absent-cursor path always seeds to *now* to avoid floods.)
 
 ## Security flag
 
