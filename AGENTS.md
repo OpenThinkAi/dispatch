@@ -55,6 +55,18 @@ role pipeline.
 - New `[[repo]]` schema fields require updates to: `src/types.ts`,
   `src/config.ts` (zod schema), and the README config section.
 
+## Known gotchas
+
+- The launchd plist's PATH is rendered once at `dispatch setup` time. If
+  the user switches node versions via nvm (and `oteam` sits under
+  `~/.nvm/...`), or moves any of `bun`/`gh`/`claude`/`oteam` to a different
+  prefix, re-run `dispatch setup --force` to regenerate the plist.
+- The triage call uses `@anthropic-ai/claude-agent-sdk`, which spawns the
+  `claude` binary as a subprocess in headless mode. That subprocess uses
+  Claude Code's OAuth login if available, falling back to
+  `ANTHROPIC_API_KEY`. Either path is fine; both must be missing for
+  triage to fail.
+
 ## Out of scope
 
 - Running on Linux as a systemd unit. Possible later, not now.

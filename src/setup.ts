@@ -44,14 +44,17 @@ function which(cmd: string): string | null {
 function renderPlist(d: Detected, intervalSec: number): string {
   const ghPath = which("gh") ?? "/opt/homebrew/bin/gh";
   const oteamPath = which("oteam") ?? "/opt/homebrew/bin/oteam";
+  const claudePath = which("claude") ?? join(d.homeDir, ".local/bin/claude");
   const pathDirs = [
     "/opt/homebrew/bin",
     join(d.homeDir, ".bun/bin"),
+    join(d.homeDir, ".local/bin"),
     "/usr/local/bin",
     "/usr/bin",
     "/bin",
     dirname(ghPath),
     dirname(oteamPath),
+    dirname(claudePath),
   ];
   const path = Array.from(new Set(pathDirs)).join(":");
   return `<?xml version="1.0" encoding="UTF-8"?>
@@ -141,9 +144,10 @@ export function runSetup(opts: SetupOptions = {}): void {
   console.log(`  1. Edit your config:           $EDITOR ${d.configPath}`);
   console.log(`  2. Make sure 'dispatch' is on PATH (symlink the shim):`);
   console.log(`         ln -s ${shimTarget} ~/.local/bin/dispatch`);
-  console.log(`  3. Set ANTHROPIC_API_KEY in your environment, then verify:`);
+  console.log(`  3. Make sure Claude Code is logged in (or ANTHROPIC_API_KEY is set), then verify:`);
+  console.log(`         claude /login                  # if not already logged in`);
   console.log(`         dispatch config validate`);
-  console.log(`         dispatch poll                    # one-shot run`);
+  console.log(`         dispatch poll                  # one-shot run`);
   console.log(`  4. Bootstrap the launchd timer:`);
   console.log(`         launchctl bootstrap gui/$(id -u) ${d.plistPath}`);
   console.log(`  5. Verify it's running:`);
