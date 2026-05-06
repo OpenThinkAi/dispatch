@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
-# Intake CLI shim. Resolves bun via PATH; launchd uses an absolute path
+# dispatch CLI shim. Resolves bun via PATH; launchd uses absolute paths
 # in the plist instead of this shim.
 set -e
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+src="${BASH_SOURCE[0]}"
+while [ -L "$src" ]; do
+  dir="$(cd -P "$(dirname "$src")" && pwd)"
+  src="$(readlink "$src")"
+  [[ "$src" != /* ]] && src="$dir/$src"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$src")" && pwd)"
 exec bun "$SCRIPT_DIR/../src/cli.ts" "$@"
