@@ -1,0 +1,14 @@
+node_modules/
+.DS_Store
+dist/
+*.log
+
+# Local config — never commit; only the .example version
+intake.toml
+
+# Local state — never commit
+.local-state/
+
+# Editor
+.vscode/
+.idea/

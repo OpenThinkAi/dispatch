@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Intake CLI shim. Resolves bun via PATH; launchd uses an absolute path
+# in the plist instead of this shim.
+set -e
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec bun "$SCRIPT_DIR/../src/cli.ts" "$@"

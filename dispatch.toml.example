@@ -1,0 +1,46 @@
+# dispatch.toml — copy to ~/.config/dispatch/dispatch.toml and edit.
+#
+# Each [[repo]] block tells dispatch:
+#   - which GitHub repo to watch
+#   - which vault to file new issues into (must be registered with oteam)
+#   - which project under that vault gets the ticket
+#   - whether dispatch may write labels back to the GitHub issue
+#
+# Tickets are filed via `oteam pull github <issue-url>`. If the project
+# doesn't exist yet, dispatch will run `oteam project init` to create it.
+#
+# First run on a new repo: dispatch seeds the cursor to "now" and ingests
+# nothing historical. To backfill, delete the slug from cursors.json.
+
+[defaults]
+state_dir              = "~/.local/state/dispatch"
+log_dir                = "~/Library/Logs/dispatch"
+poll_interval_minutes  = 5
+triage_model           = "claude-haiku-4-5-20251001"
+body_truncate_chars    = 8000
+
+# ─────────────────────────────────────────────────────────────────
+# Examples — replace with your own repos.
+# ─────────────────────────────────────────────────────────────────
+
+# A repo you own: poll all issues, allow dispatch to apply triage labels.
+[[repo]]
+slug      = "myorg/my-app"
+vault     = "my-vault"
+project   = "my-app"
+can_label = true
+
+# A repo you contribute to but don't admin: still poll, but don't write
+# labels (set can_label = false to skip the gh write).
+[[repo]]
+slug      = "anotherorg/some-lib"
+vault     = "my-vault"
+project   = "some-lib"
+can_label = false
+
+# A second vault — useful for separating personal vs. work projects.
+[[repo]]
+slug      = "myorg/internal-tool"
+vault     = "work-vault"
+project   = "internal-tool"
+can_label = true
