@@ -3,11 +3,20 @@
 # Each [[repo]] block tells dispatch:
 #   - which GitHub repo to watch
 #   - which vault to file new issues into (must be registered with oteam)
-#   - which project under that vault gets the ticket
+#   - which existing project gets the ticket (dispatch never auto-creates)
 #   - whether dispatch may write labels back to the GitHub issue
 #
-# Tickets are filed via `oteam pull github <issue-url>`. If the project
-# doesn't exist yet, dispatch will run `oteam project init` to create it.
+# Tickets are filed via `oteam pull github <issue-url>`. The configured
+# vault must be registered (`oteam config vault list`) and the configured
+# project must exist (`oteam project list --vault <vault>`); otherwise
+# dispatch refuses to file. The recommended pattern is a single
+# `triage-inbox` project per vault — every repo funnels into it, and the
+# vault's role pipeline re-files into the right active work stream.
+#
+#   oteam project init triage-inbox --vault <vault> --no-edit
+#
+# Override per-repo by setting `project = "<active-work-stream>"` if
+# you want a specific repo's issues to land directly in an active stream.
 #
 # First run on a new repo: dispatch seeds the cursor to "now" and ingests
 # nothing historical. To backfill, delete the slug from cursors.json.
@@ -23,24 +32,34 @@ body_truncate_chars    = 8000
 # Examples — replace with your own repos.
 # ─────────────────────────────────────────────────────────────────
 
-# A repo you own: poll all issues, allow dispatch to apply triage labels.
+# A repo you own. Issues land in the vault's triage-inbox where you (or
+# the vault's role pipeline) re-file them into active work streams.
 [[repo]]
 slug      = "myorg/my-app"
 vault     = "my-vault"
-project   = "my-app"
+project   = "triage-inbox"
 can_label = true
 
-# A repo you contribute to but don't admin: still poll, but don't write
-# labels (set can_label = false to skip the gh write).
+# A repo you contribute to but don't admin: same destination, just don't
+# write labels back to the public issue.
 [[repo]]
 slug      = "anotherorg/some-lib"
 vault     = "my-vault"
-project   = "some-lib"
+project   = "triage-inbox"
 can_label = false
 
 # A second vault — useful for separating personal vs. work projects.
+# Make sure it has its own triage-inbox: `oteam project init triage-inbox --vault work-vault --no-edit`.
 [[repo]]
 slug      = "myorg/internal-tool"
 vault     = "work-vault"
-project   = "internal-tool"
+project   = "triage-inbox"
+can_label = true
+
+# Per-repo override: route a hot repo straight to its active work stream
+# instead of through triage-inbox. The project must already exist.
+[[repo]]
+slug      = "myorg/critical-thing"
+vault     = "my-vault"
+project   = "critical-thing-launch"
 can_label = true

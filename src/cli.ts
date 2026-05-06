@@ -83,20 +83,38 @@ async function main(argv: string[]): Promise<number> {
 
     case "config": {
       if (sub === "validate") {
+        let cfg;
         try {
-          const cfg = loadConfig();
-          console.log(`OK: ${cfg.repos.length} repos, config at ${cfg.defaults.config_path}`);
-          return 0;
+          cfg = loadConfig();
         } catch (e) {
           console.error((e as Error).message);
           return 1;
         }
+        const skipVaults = rest.includes("--no-vault-check");
+        if (skipVaults) {
+          console.log(`OK (structural only): ${cfg.repos.length} repos, config at ${cfg.defaults.config_path}`);
+          return 0;
+        }
+        const { buildProjectIndex, findMissingProjects } = await import("./sinks/vault.ts");
+        const { index, errors: idxErrors } = buildProjectIndex(cfg);
+        for (const e of idxErrors) console.error(`vault unavailable: ${e.vault} — ${e.reason}`);
+        const missing = findMissingProjects(cfg, index);
+        if (missing.length > 0) {
+          console.error(`Missing projects (${missing.length}):`);
+          for (const r of missing) console.error(`  ${r.slug.padEnd(48)}  vault=${r.vault}  project=${r.project}`);
+          console.error("");
+          console.error("Create them with:  oteam project init <project> --vault <vault> --no-edit");
+          return 1;
+        }
+        if (idxErrors.length > 0) return 1;
+        console.log(`OK: ${cfg.repos.length} repos, config at ${cfg.defaults.config_path}`);
+        return 0;
       }
       if (sub === "path") {
         console.log(configPath());
         return 0;
       }
-      console.error("usage: dispatch config <validate|path>");
+      console.error("usage: dispatch config <validate [--no-vault-check] | path>");
       return 2;
     }
 

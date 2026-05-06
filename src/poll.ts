@@ -4,13 +4,19 @@ import { State, hashIssueContent } from "./state.ts";
 import { triageIssue } from "./triage.ts";
 import { applyLabels } from "./sinks/labels.ts";
 import { holdForSecurityReview } from "./sinks/security.ts";
-import { ensureProject, pullIntoVault } from "./sinks/vault.ts";
+import { buildProjectIndex, pullIntoVault, type ProjectIndex } from "./sinks/vault.ts";
 import type { Config, GitHubIssue, ProcessOutcome, RepoConfig } from "./types.ts";
 
 export async function pollOnce(cfg: Config): Promise<{ processed: number; errors: number }> {
   const state = new State(cfg.defaults.state_dir);
   let processed = 0;
   let errors = 0;
+
+  const { index: projectIndex, errors: indexErrors } = buildProjectIndex(cfg);
+  for (const e of indexErrors) {
+    log.error("project index unavailable", { vault: e.vault, reason: e.reason });
+    errors += 1;
+  }
 
   try {
     for (const repo of cfg.repos) {
@@ -30,7 +36,7 @@ export async function pollOnce(cfg: Config): Promise<{ processed: number; errors
 
         let maxUpdated = since;
         for (const issue of issues) {
-          const outcome = await processIssue({ issue, repo, cfg, state });
+          const outcome = await processIssue({ issue, repo, cfg, state, projectIndex });
           processed += 1;
           if (outcome.kind === "error") errors += 1;
           if (issue.updated_at > maxUpdated) maxUpdated = issue.updated_at;
@@ -54,6 +60,7 @@ export async function processIssue(args: {
   repo: RepoConfig;
   cfg: Config;
   state: State;
+  projectIndex?: ProjectIndex;
 }): Promise<ProcessOutcome> {
   const { issue, repo, cfg, state } = args;
   const hash = hashIssueContent(issue.title, issue.body);
@@ -97,16 +104,19 @@ export async function processIssue(args: {
     return { kind: "security-held", flag: triage.security_flag };
   }
 
-  try {
-    ensureProject(repo.vault, repo.project);
-  } catch (e) {
-    log.error("project ensure failed", {
+  const index = args.projectIndex ?? buildProjectIndex(cfg).index;
+  const projects = index.get(repo.vault);
+  if (!projects || !projects.has(repo.project)) {
+    const reason = !projects
+      ? `vault ${repo.vault} not registered with oteam (or list failed)`
+      : `project ${repo.project} does not exist in vault ${repo.vault}`;
+    log.error("project verification failed", {
       slug: repo.slug,
       project: repo.project,
       vault: repo.vault,
-      error: (e as Error).message,
+      reason,
     });
-    return { kind: "error", error: (e as Error).message };
+    return { kind: "error", error: reason };
   }
 
   const isUpdate = !!existing;

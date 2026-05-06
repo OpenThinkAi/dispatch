@@ -29,7 +29,12 @@ gh poll → for each new issue:
 - macOS, Bun ≥ 1.3
 - [`gh`](https://cli.github.com) logged in (`gh auth status`)
 - [`@openthink/team`](https://www.npmjs.com/package/@openthink/team) (`oteam`)
-  on PATH with the target vaults registered (`oteam config vault`)
+  on PATH with the target vaults registered (`oteam config vault add ...`)
+- A `triage-inbox` project (or whatever you configure) already in each
+  vault — dispatch never auto-creates projects:
+  ```sh
+  oteam project init triage-inbox --vault <vault> --no-edit
+  ```
 - A Claude account — either Claude Code logged in (`claude /login`) or an
   `ANTHROPIC_API_KEY` env var. The triage call uses the
   [Claude Agent SDK](https://www.npmjs.com/package/@anthropic-ai/claude-agent-sdk)
@@ -76,15 +81,38 @@ body_truncate_chars    = 8000
 
 [[repo]]
 slug      = "myorg/my-app"
-vault     = "my-vault"     # must be registered with `oteam config vault`
-project   = "my-app"       # auto-created via `oteam project init` if missing
-can_label = true           # may dispatch write labels back to the issue?
+vault     = "my-vault"          # must be registered with `oteam config vault`
+project   = "triage-inbox"      # must already exist in <vault>
+can_label = true                # may dispatch write labels back to the issue?
 ```
+
+`dispatch config validate` cross-checks every `(vault, project)` pair
+against `oteam project list` and refuses to start if anything is
+missing. Use `--no-vault-check` to skip the cross-check (structural
+parse only).
 
 `[defaults]` controls the state directory, log directory, polling
 cadence, the model used for triage, and the body-truncate length passed
 to the model. Everything has reasonable defaults — most setups only need
 to add `[[repo]]` blocks.
+
+### Routing model
+
+The recommended default is **a single `triage-inbox` project per vault**:
+every repo funnels into it, and the vault's role pipeline (`oteam assign`)
+re-files into active work streams. Tickets keep their `source_repo`
+metadata so you can slice the inbox by repo (`oteam list --grep <repo>`).
+
+For repos with active, well-defined work streams, override the project
+on a per-repo basis to route directly:
+
+```toml
+[[repo]]
+slug    = "myorg/critical-thing"
+vault   = "my-vault"
+project = "critical-thing-launch"   # must exist
+can_label = true
+```
 
 ## Day-to-day
 
@@ -181,18 +209,19 @@ bin/dispatch          # bash shim → bun src/cli.ts
 
 ## Known gotchas
 
-- **Vault projects are work streams in oteam, not repo names.** The
-  recommended pattern is to map each `[[repo]]` to a long-lived
-  "landing zone" project (often the repo's bare name) and then have
-  the vault's role pipeline re-file from that project into whatever
-  active work stream is appropriate. Alternative: a single
-  `triage-inbox` project per vault that everything funnels into.
-- `oteam pull` accepts URLs in the form
-  `https://github.com/owner/repo/issues/N`. If your version of `oteam`
+- **dispatch never auto-creates vault projects.** If a configured project
+  is missing, `dispatch config validate` reports it and the runtime
+  refuses to file. Run `oteam project init <project> --vault <vault>
+  --no-edit` to create what's missing.
+- **`oteam pull` accepts URLs in the form
+  `https://github.com/owner/repo/issues/N`.** If your version of `oteam`
   expects a different ref form, the vault sink will need adjustment.
-- `gh issue edit --add-label` requires the label to exist on the repo.
+- **`gh issue edit --add-label` requires the label to exist on the repo.**
   Triage suggests labels from a small standard set; if the repo doesn't
   have those labels, the apply silently fails (logged as a warning).
+- **The launchd plist's PATH is rendered once at `dispatch setup` time.**
+  If you switch node versions via nvm, or move `bun`/`gh`/`claude`/`oteam`
+  to a different prefix, re-run `dispatch setup --force` to regenerate.
 
 ## License
 
