@@ -2,14 +2,27 @@ import { Database } from "bun:sqlite";
 import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
+import type { CuratorAction, TriageStatus } from "./types.ts";
 
 export type SeenRow = {
   slug: string;
   number: number;
   vault_ticket_id: string | null;
   content_hash: string;
+  triage_status: TriageStatus;
   first_processed_at: string;
   last_processed_at: string;
+};
+
+export type CuratorDecisionRow = {
+  slug: string;
+  number: number;
+  decided_at: string;
+  decision: CuratorAction;
+  reasoning: string;
+  related_tickets: string;     // JSON array
+  related_gh_issues: string;   // JSON array
+  cost_usd: number | null;
 };
 
 export class State {
@@ -31,7 +44,32 @@ export class State {
         PRIMARY KEY (slug, number)
       );
       CREATE INDEX IF NOT EXISTS seen_last_idx ON seen(last_processed_at);
+
+      CREATE TABLE IF NOT EXISTS curator_decisions (
+        slug TEXT NOT NULL,
+        number INTEGER NOT NULL,
+        decided_at TEXT NOT NULL,
+        decision TEXT NOT NULL,
+        reasoning TEXT NOT NULL,
+        related_tickets TEXT NOT NULL DEFAULT '[]',
+        related_gh_issues TEXT NOT NULL DEFAULT '[]',
+        cost_usd REAL,
+        PRIMARY KEY (slug, number, decided_at)
+      );
+      CREATE INDEX IF NOT EXISTS curator_decisions_recent_idx ON curator_decisions(decided_at);
     `);
+
+    // Migrate: add triage_status column if missing.
+    const hasTriageStatus = this.db
+      .query<{ name: string }, []>("PRAGMA table_info(seen)")
+      .all()
+      .some(c => c.name === "triage_status");
+    if (!hasTriageStatus) {
+      this.db.exec(
+        `ALTER TABLE seen ADD COLUMN triage_status TEXT NOT NULL DEFAULT 'awaiting-curation';`
+      );
+    }
+
     this.cursorsPath = join(stateDir, "cursors.json");
     this.cursors = existsSync(this.cursorsPath)
       ? JSON.parse(readFileSync(this.cursorsPath, "utf-8"))
@@ -69,28 +107,77 @@ export class State {
     number: number;
     vault_ticket_id: string | null;
     content_hash: string;
+    triage_status?: TriageStatus;
   }): void {
     const now = new Date().toISOString();
+    const status: TriageStatus = args.triage_status ?? "awaiting-curation";
     const existing = this.getSeen(args.slug, args.number);
     if (existing) {
       this.db.run(
-        `UPDATE seen SET vault_ticket_id = ?, content_hash = ?, last_processed_at = ?
+        `UPDATE seen SET vault_ticket_id = ?, content_hash = ?, triage_status = ?, last_processed_at = ?
          WHERE slug = ? AND number = ?`,
-        [args.vault_ticket_id, args.content_hash, now, args.slug, args.number]
+        [args.vault_ticket_id, args.content_hash, status, now, args.slug, args.number]
       );
     } else {
       this.db.run(
-        `INSERT INTO seen (slug, number, vault_ticket_id, content_hash, first_processed_at, last_processed_at)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-        [args.slug, args.number, args.vault_ticket_id, args.content_hash, now, now]
+        `INSERT INTO seen (slug, number, vault_ticket_id, content_hash, triage_status, first_processed_at, last_processed_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [args.slug, args.number, args.vault_ticket_id, args.content_hash, status, now, now]
       );
     }
+  }
+
+  setTriageStatus(slug: string, number: number, status: TriageStatus): void {
+    const now = new Date().toISOString();
+    this.db.run(
+      `UPDATE seen SET triage_status = ?, last_processed_at = ? WHERE slug = ? AND number = ?`,
+      [status, now, slug, number]
+    );
+  }
+
+  /** Find all seen rows in a given lifecycle status (newest first). */
+  listByStatus(status: TriageStatus, limit = 100): SeenRow[] {
+    return this.db
+      .query("SELECT * FROM seen WHERE triage_status = ? ORDER BY last_processed_at DESC LIMIT ?")
+      .all(status, limit) as SeenRow[];
+  }
+
+  recordCuratorDecision(args: {
+    slug: string;
+    number: number;
+    decision: CuratorAction;
+    reasoning: string;
+    related_tickets: string[];
+    related_gh_issues: number[];
+    cost_usd: number | null;
+  }): void {
+    this.db.run(
+      `INSERT INTO curator_decisions
+         (slug, number, decided_at, decision, reasoning, related_tickets, related_gh_issues, cost_usd)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        args.slug,
+        args.number,
+        new Date().toISOString(),
+        args.decision,
+        args.reasoning,
+        JSON.stringify(args.related_tickets),
+        JSON.stringify(args.related_gh_issues),
+        args.cost_usd,
+      ]
+    );
   }
 
   recentSeen(limit = 50): SeenRow[] {
     return this.db
       .query("SELECT * FROM seen ORDER BY last_processed_at DESC LIMIT ?")
       .all(limit) as SeenRow[];
+  }
+
+  recentCuratorDecisions(limit = 20): CuratorDecisionRow[] {
+    return this.db
+      .query("SELECT * FROM curator_decisions ORDER BY decided_at DESC LIMIT ?")
+      .all(limit) as CuratorDecisionRow[];
   }
 
   allCursors(): Record<string, string> {

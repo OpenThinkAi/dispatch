@@ -12,20 +12,20 @@ Usage:
   dispatch <command> [args]
 
 Commands:
-  poll                       One-shot: poll all configured repos, triage new issues, file into vault
+  poll                       One-shot: ingest, curate, orchestrate
   watch [--interval SEC]     Foreground loop calling poll (default 300s); for dev/debug
-  process <url-or-ref>       Manually triage one issue (https://...issues/42 or owner/repo#42)
-  config validate            Parse config and report any issues; exit non-zero on failure
+  process <url-or-ref>       Manually ingest one issue (does NOT trigger curation)
+  config validate            Parse config + cross-check vault projects; exit non-zero on failure
   config path                Print resolved config path
-  state show                 Print cursors and the most recent processed issues
+  state show                 Print cursors, recent processed issues, recent curator decisions
   setup [--force] [--interval SEC] [--dry-run]
                              Detect machine, write the launchd plist, and seed config
   help                       Show this message
 
 Environment:
-  DISPATCH_CONFIG              Override config path (default ~/.config/dispatch/dispatch.toml)
-  ANTHROPIC_API_KEY          Required for triage
-  DISPATCH_DEBUG=1             Verbose logging
+  DISPATCH_CONFIG            Override config path (default ~/.config/dispatch/dispatch.toml)
+  ANTHROPIC_API_KEY          Used by triage + curator if Claude Code isn't logged in
+  DISPATCH_DEBUG=1           Verbose logging
 `;
 
 async function main(argv: string[]): Promise<number> {
@@ -125,13 +125,20 @@ async function main(argv: string[]): Promise<number> {
         try {
           const cursors = state.allCursors();
           const recent = state.recentSeen(20);
+          const decisions = state.recentCuratorDecisions(10);
           console.log("Cursors:");
           for (const [slug, ts] of Object.entries(cursors)) {
             console.log(`  ${slug.padEnd(50)}  ${ts}`);
           }
           console.log("\nMost recent processed:");
           for (const r of recent) {
-            console.log(`  ${r.last_processed_at}  ${r.slug}#${r.number}  ${r.vault_ticket_id ?? "(held)"}`);
+            const status = (r.triage_status ?? "?").padEnd(18);
+            console.log(`  ${r.last_processed_at}  ${status}  ${r.slug}#${r.number}  ${r.vault_ticket_id ?? "(held)"}`);
+          }
+          console.log("\nRecent curator decisions:");
+          for (const d of decisions) {
+            console.log(`  ${d.decided_at}  ${d.decision.padEnd(11)}  ${d.slug}#${d.number}  $${(d.cost_usd ?? 0).toFixed(4)}`);
+            console.log(`    ${d.reasoning.split("\n")[0].slice(0, 140)}`);
           }
           return 0;
         } finally {

@@ -1,8 +1,13 @@
+export type Autopilot = "off" | "curate-only" | "fire";
+
+export const AUTOPILOT_VALUES: Autopilot[] = ["off", "curate-only", "fire"];
+
 export type RepoConfig = {
   slug: string;
   vault: string;
   project: string;
   can_label: boolean;
+  autopilot: Autopilot;
   description?: string;
 };
 
@@ -13,6 +18,12 @@ export type Defaults = {
   poll_interval_minutes: number;
   triage_model: string;
   body_truncate_chars: number;
+  curator_model: string;
+  per_tick_max_budget_usd: number;
+  per_call_max_budget_usd: number;
+  max_orchestrator_spawns_per_tick: number;
+  recent_vault_tickets_window_days: number;
+  recent_vault_tickets_cap: number;
 };
 
 export type Config = {
@@ -52,3 +63,73 @@ export type ProcessOutcome =
   | { kind: "filed"; ticketRef: string | null }
   | { kind: "updated"; ticketRef: string | null }
   | { kind: "error"; error: string };
+
+/**
+ * Lifecycle of an ingested issue, post-triage.
+ *
+ *   awaiting-curation ── curator ─┬─ (gh-comment) ─→ gh-resolved (terminal)
+ *                                 │
+ *                                 ├─ (hold)        ─→ held-for-human (terminal until human acts)
+ *                                 │
+ *                                 └─ (fire)        ─→ green-lit
+ *                                                          │
+ *                                                          │ orchestrator picks up
+ *                                                          ↓
+ *                                                        fired ─── monitored ──→ completed
+ *                                                                              └→ failed
+ */
+export type TriageStatus =
+  | "awaiting-curation"
+  | "green-lit"
+  | "held-for-human"
+  | "gh-resolved"
+  | "fired"
+  | "completed"
+  | "failed";
+
+export const TRIAGE_STATUS_VALUES: TriageStatus[] = [
+  "awaiting-curation",
+  "green-lit",
+  "held-for-human",
+  "gh-resolved",
+  "fired",
+  "completed",
+  "failed",
+];
+
+export type CuratorAction = "fire" | "gh-comment" | "hold";
+
+export type CuratorDecision =
+  | {
+      action: "fire";
+      reasoning: string;
+      related_tickets: string[];
+      related_gh_issues: number[];
+    }
+  | {
+      action: "gh-comment";
+      reasoning: string;
+      related_tickets: string[];
+      related_gh_issues: number[];
+      gh_comment: string;
+      close_gh: boolean;
+    }
+  | {
+      action: "hold";
+      reasoning: string;
+      related_tickets: string[];
+      related_gh_issues: number[];
+      vault_comment: string;
+      gh_comment_optional?: string;
+    };
+
+/** Lightweight summary of a vault ticket, used as curator input. */
+export type VaultTicketSummary = {
+  id: string;
+  title: string;
+  state: string;
+  repo: string | null;
+  source_type: string;
+  one_line_summary: string;
+  path: string;
+};

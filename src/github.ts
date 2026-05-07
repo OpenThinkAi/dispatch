@@ -69,3 +69,36 @@ export function addLabels(slug: string, number: number, labels: string[]): void 
   const r = gh(args);
   if (!r.ok) throw new Error(`gh add-labels failed for ${slug}#${number}: ${r.stderr}`);
 }
+
+/** List currently-open issues on a repo (excluding PRs), capped. Used as curator context. */
+export function listOpenIssues(slug: string, cap = 50): GitHubIssue[] {
+  const r = gh([
+    "api",
+    `repos/${slug}/issues?state=open&per_page=${cap}&sort=updated&direction=desc`,
+    "-H", "Accept: application/vnd.github+json",
+  ]);
+  if (!r.ok) throw new Error(`gh open-issues fetch failed for ${slug}: ${r.stderr}`);
+  let arr: GitHubIssue[];
+  try { arr = JSON.parse(r.stdout); } catch (e) {
+    throw new Error(`gh open-issues returned non-JSON for ${slug}: ${(e as Error).message}`);
+  }
+  return Array.isArray(arr) ? arr.filter(it => !(it as GitHubIssue).pull_request) : [];
+}
+
+export function commentOnIssue(slug: string, number: number, body: string): void {
+  const r = gh([
+    "issue", "comment", String(number),
+    "--repo", slug,
+    "--body", body,
+  ]);
+  if (!r.ok) throw new Error(`gh issue comment failed for ${slug}#${number}: ${r.stderr}`);
+}
+
+export function closeIssue(slug: string, number: number, reason: "completed" | "not_planned" = "completed"): void {
+  const r = gh([
+    "issue", "close", String(number),
+    "--repo", slug,
+    "--reason", reason,
+  ]);
+  if (!r.ok) throw new Error(`gh issue close failed for ${slug}#${number}: ${r.stderr}`);
+}

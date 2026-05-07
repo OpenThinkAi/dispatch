@@ -4,12 +4,14 @@ import { join, resolve } from "node:path";
 import { parse as parseToml } from "smol-toml";
 import { z } from "zod";
 import type { Config } from "./types.ts";
+import { AUTOPILOT_VALUES } from "./types.ts";
 
 const RepoSchema = z.object({
   slug: z.string().regex(/^[^/]+\/[^/]+$/, "slug must be owner/repo"),
   vault: z.string().min(1),
   project: z.string().min(1),
   can_label: z.boolean().default(true),
+  autopilot: z.enum(AUTOPILOT_VALUES as [string, ...string[]]).default("off"),
   description: z.string().optional(),
 });
 
@@ -19,6 +21,12 @@ const DefaultsSchema = z.object({
   poll_interval_minutes: z.number().int().positive().default(5),
   triage_model: z.string().default("claude-haiku-4-5-20251001"),
   body_truncate_chars: z.number().int().positive().default(8000),
+  curator_model: z.string().default("claude-sonnet-4-6"),
+  per_tick_max_budget_usd: z.number().positive().default(2.0),
+  per_call_max_budget_usd: z.number().positive().default(0.50),
+  max_orchestrator_spawns_per_tick: z.number().int().min(0).default(1),
+  recent_vault_tickets_window_days: z.number().int().positive().default(60),
+  recent_vault_tickets_cap: z.number().int().positive().default(40),
 });
 
 const ConfigFileSchema = z.object({
@@ -73,8 +81,14 @@ export function loadConfig(path: string = configPath()): Config {
       poll_interval_minutes: data.defaults.poll_interval_minutes,
       triage_model: data.defaults.triage_model,
       body_truncate_chars: data.defaults.body_truncate_chars,
+      curator_model: data.defaults.curator_model,
+      per_tick_max_budget_usd: data.defaults.per_tick_max_budget_usd,
+      per_call_max_budget_usd: data.defaults.per_call_max_budget_usd,
+      max_orchestrator_spawns_per_tick: data.defaults.max_orchestrator_spawns_per_tick,
+      recent_vault_tickets_window_days: data.defaults.recent_vault_tickets_window_days,
+      recent_vault_tickets_cap: data.defaults.recent_vault_tickets_cap,
     },
-    repos: data.repo,
+    repos: data.repo as Config["repos"],
   };
 }
 
