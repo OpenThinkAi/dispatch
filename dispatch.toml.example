@@ -30,6 +30,11 @@
 # fire         → curate AND, for green-lit tickets, autonomously fire `oteam assign`
 #                to drive the role pipeline. Most aggressive; reserve for repos
 #                where you fully trust the agent fleet to act unsupervised.
+#
+# When any repo is in fire mode, dispatch claims the GH issue (sets `assignees`
+# to `defaults.bot_identity`) before invoking `oteam assign`. Other actors
+# (humans assigning themselves in the GH UI, other dispatch instances) cause
+# the claim to fail and the ticket transitions to `lost-race` instead of firing.
 
 [defaults]
 state_dir                          = "~/.local/state/dispatch"
@@ -45,6 +50,13 @@ per_tick_max_budget_usd            = 2.00
 max_orchestrator_spawns_per_tick   = 1
 recent_vault_tickets_window_days   = 60
 recent_vault_tickets_cap           = 40
+
+# GitHub login that the curator uses to claim issues before firing the
+# orchestrator. Required when any repo has `autopilot = "fire"`. The
+# operator's own login is the simplest choice; a dedicated bot account
+# works if the operator wants to disambiguate human vs. automated claims
+# in the GH UI.
+bot_identity                       = ""
 
 # ─────────────────────────────────────────────────────────────────
 # Examples — replace with your own repos.

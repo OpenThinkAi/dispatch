@@ -8,6 +8,13 @@ function gh(args: string[]): { ok: true; stdout: string } | { ok: false; stderr:
   return { ok: true, stdout: r.stdout };
 }
 
+function ghWithInput(args: string[], input: string): { ok: true; stdout: string } | { ok: false; stderr: string } {
+  const r = spawnSync("gh", args, { encoding: "utf-8", input });
+  if (r.error) return { ok: false, stderr: r.error.message };
+  if (r.status !== 0) return { ok: false, stderr: r.stderr || `gh exited ${r.status}` };
+  return { ok: true, stdout: r.stdout };
+}
+
 /**
  * List issues in a repo updated at or after `since`. Excludes pull requests.
  * Returns up to `perPage` items per page across all pages.
@@ -101,4 +108,82 @@ export function closeIssue(slug: string, number: number, reason: "completed" | "
     "--reason", reason,
   ]);
   if (!r.ok) throw new Error(`gh issue close failed for ${slug}#${number}: ${r.stderr}`);
+}
+
+export type IssueClaim =
+  | { ok: true; assignees: string[] }
+  | { ok: false; reason: "issue-closed" }
+  | { ok: false; reason: "already-claimed"; assignees: string[] }
+  | { ok: false; reason: "no-write-access" }
+  | { ok: false; reason: "api-error"; error: string };
+
+/**
+ * Atomically claim a GH issue for `identity` before doing work on it.
+ *
+ * Protocol:
+ *   1. GET the issue.
+ *   2. If state=closed → bail (issue-closed).
+ *   3. If already assigned to someone other than identity → bail (already-claimed).
+ *   4. PATCH assignees: [identity].
+ *   5. Inspect PATCH response. If assignees came back empty, the operator's
+ *      token doesn't have push access (GitHub silently drops assignee changes
+ *      without it) → bail (no-write-access). If assignees != [identity] —
+ *      a race with another writer — bail (already-claimed).
+ *
+ * The race window between step 1 and step 4 is tiny but non-zero. The post-PATCH
+ * verification catches the case where two callers both saw the issue unassigned
+ * and both PATCHed; whoever reads back themselves alone wins, the other bails.
+ */
+export function claimIssue(slug: string, number: number, identity: string): IssueClaim {
+  if (!identity) {
+    return { ok: false, reason: "api-error", error: "claimIssue called with empty identity" };
+  }
+
+  const getR = gh([
+    "api", `repos/${slug}/issues/${number}`,
+    "-H", "Accept: application/vnd.github+json",
+  ]);
+  if (!getR.ok) return { ok: false, reason: "api-error", error: getR.stderr };
+
+  let issue: GitHubIssue;
+  try {
+    issue = JSON.parse(getR.stdout);
+  } catch (e) {
+    return { ok: false, reason: "api-error", error: `non-JSON GET response: ${(e as Error).message}` };
+  }
+
+  if (issue.state === "closed") return { ok: false, reason: "issue-closed" };
+
+  const existing = (issue.assignees ?? []).map(a => a.login);
+  if (existing.length > 0 && !existing.includes(identity)) {
+    return { ok: false, reason: "already-claimed", assignees: existing };
+  }
+
+  const patchR = ghWithInput(
+    [
+      "api", `repos/${slug}/issues/${number}`,
+      "-X", "PATCH",
+      "--input", "-",
+      "-H", "Accept: application/vnd.github+json",
+    ],
+    JSON.stringify({ assignees: [identity] }),
+  );
+  if (!patchR.ok) return { ok: false, reason: "api-error", error: patchR.stderr };
+
+  let updated: GitHubIssue;
+  try {
+    updated = JSON.parse(patchR.stdout);
+  } catch (e) {
+    return { ok: false, reason: "api-error", error: `non-JSON PATCH response: ${(e as Error).message}` };
+  }
+
+  if (updated.state === "closed") return { ok: false, reason: "issue-closed" };
+
+  const after = (updated.assignees ?? []).map(a => a.login);
+  if (after.length === 0) return { ok: false, reason: "no-write-access" };
+  if (after.length !== 1 || after[0] !== identity) {
+    return { ok: false, reason: "already-claimed", assignees: after };
+  }
+
+  return { ok: true, assignees: after };
 }

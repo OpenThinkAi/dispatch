@@ -24,6 +24,13 @@ export type Defaults = {
   max_orchestrator_spawns_per_tick: number;
   recent_vault_tickets_window_days: number;
   recent_vault_tickets_cap: number;
+  /**
+   * GitHub login the curator uses to claim issues before firing the
+   * orchestrator. Must be a valid assignee on every repo that has
+   * `autopilot = "fire"`. Required when any repo is in fire mode;
+   * otherwise unused.
+   */
+  bot_identity: string;
 };
 
 export type Config = {
@@ -39,6 +46,7 @@ export type GitHubIssue = {
   body: string | null;
   state: "open" | "closed";
   labels: { name: string }[];
+  assignees?: { login: string }[];
   user: { login: string } | null;
   created_at: string;
   updated_at: string;
@@ -73,6 +81,9 @@ export type ProcessOutcome =
  *                                 │
  *                                 └─ (fire)        ─→ green-lit
  *                                                          │
+ *                                                          │ claim attempt
+ *                                                          ├─→ lost-race (someone else has the GH issue)
+ *                                                          │
  *                                                          │ orchestrator picks up
  *                                                          ↓
  *                                                        fired ─── monitored ──→ completed
@@ -85,7 +96,8 @@ export type TriageStatus =
   | "gh-resolved"
   | "fired"
   | "completed"
-  | "failed";
+  | "failed"
+  | "lost-race";
 
 export const TRIAGE_STATUS_VALUES: TriageStatus[] = [
   "awaiting-curation",
@@ -95,6 +107,7 @@ export const TRIAGE_STATUS_VALUES: TriageStatus[] = [
   "fired",
   "completed",
   "failed",
+  "lost-race",
 ];
 
 export type CuratorAction = "fire" | "gh-comment" | "hold";
