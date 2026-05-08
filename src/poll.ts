@@ -1,6 +1,6 @@
 import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import { listIssuesSince } from "./github.ts";
+import { claimIssue, listIssuesSince } from "./github.ts";
 import { log } from "./log.ts";
 import { State, hashIssueContent } from "./state.ts";
 import { triageIssue } from "./triage.ts";
@@ -199,6 +199,43 @@ async function curateAndOrchestrate(cfg: Config, state: State, summary: PollSumm
         state.setTriageStatus(row.slug, row.number, "green-lit");
         continue;
       }
+
+      // Claim the GH issue before invoking oteam assign so other actors
+      // (humans, other dispatch instances) see this work is taken.
+      const claim = claimIssue(row.slug, row.number, cfg.defaults.bot_identity);
+      if (!claim.ok) {
+        if (claim.reason === "already-claimed") {
+          log.info("issue already claimed; skipping fire", {
+            slug: row.slug,
+            number: row.number,
+            assignees: claim.assignees,
+          });
+          appendVaultComment(
+            ticketPath,
+            "Curator",
+            `**Curator decision:** fire (autopilot=fire, NOT executing — issue assigned to ${claim.assignees.join(", ")})\n\n${decision.reasoning}`
+          );
+          state.setTriageStatus(row.slug, row.number, "lost-race");
+          continue;
+        }
+        if (claim.reason === "issue-closed") {
+          log.info("issue closed before claim; skipping fire", { slug: row.slug, number: row.number });
+          state.setTriageStatus(row.slug, row.number, "gh-resolved");
+          summary.gh_resolved += 1;
+          continue;
+        }
+        // no-write-access or api-error: leave green-lit so the next tick can retry.
+        log.error("claim failed; deferring fire", {
+          slug: row.slug,
+          number: row.number,
+          reason: claim.reason,
+          error: claim.reason === "api-error" ? claim.error : undefined,
+        });
+        state.setTriageStatus(row.slug, row.number, "green-lit");
+        summary.errors += 1;
+        continue;
+      }
+
       const spawn = spawnOteamAssign(ticketPath, cfg.defaults.log_dir);
       if (!spawn.ok) {
         log.error("oteam assign spawn failed", {

@@ -27,6 +27,7 @@ const DefaultsSchema = z.object({
   max_orchestrator_spawns_per_tick: z.number().int().min(0).default(1),
   recent_vault_tickets_window_days: z.number().int().positive().default(60),
   recent_vault_tickets_cap: z.number().int().positive().default(40),
+  bot_identity: z.string().default(""),
 });
 
 const ConfigFileSchema = z.object({
@@ -73,6 +74,16 @@ export function loadConfig(path: string = configPath()): Config {
     seen.add(r.slug);
   }
 
+  // bot_identity is required when any repo is in fire mode (curator claims
+  // the GH issue before invoking oteam assign).
+  const hasFireRepo = data.repo.some(r => r.autopilot === "fire");
+  if (hasFireRepo && !data.defaults.bot_identity) {
+    throw new Error(
+      `defaults.bot_identity is required when any repo has autopilot = "fire". ` +
+      `Set it to the GitHub login that should claim issues (e.g. your own login).`
+    );
+  }
+
   return {
     defaults: {
       state_dir: expandHome(data.defaults.state_dir),
@@ -87,6 +98,7 @@ export function loadConfig(path: string = configPath()): Config {
       max_orchestrator_spawns_per_tick: data.defaults.max_orchestrator_spawns_per_tick,
       recent_vault_tickets_window_days: data.defaults.recent_vault_tickets_window_days,
       recent_vault_tickets_cap: data.defaults.recent_vault_tickets_cap,
+      bot_identity: data.defaults.bot_identity,
     },
     repos: data.repo as Config["repos"],
   };

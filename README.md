@@ -78,6 +78,9 @@ log_dir                = "~/Library/Logs/dispatch"
 poll_interval_minutes  = 5
 triage_model           = "claude-haiku-4-5-20251001"
 body_truncate_chars    = 8000
+bot_identity           = ""     # GitHub login dispatch uses to claim issues
+                                # before firing the orchestrator; required
+                                # when any repo has autopilot = "fire"
 
 [[repo]]
 slug      = "myorg/my-app"
@@ -88,13 +91,44 @@ can_label = true                # may dispatch write labels back to the issue?
 
 `dispatch config validate` cross-checks every `(vault, project)` pair
 against `oteam project list` and refuses to start if anything is
-missing. Use `--no-vault-check` to skip the cross-check (structural
-parse only).
+missing. It also rejects the config if any repo has `autopilot = "fire"`
+and `bot_identity` is empty. Use `--no-vault-check` to skip the
+project cross-check (structural parse only).
 
 `[defaults]` controls the state directory, log directory, polling
 cadence, the model used for triage, and the body-truncate length passed
 to the model. Everything has reasonable defaults — most setups only need
 to add `[[repo]]` blocks.
+
+### Issue claims (autopilot = fire)
+
+When the curator decides to fire `oteam assign` on a green-lit ticket,
+dispatch first **claims the underlying GH issue** by setting its
+`assignees` to `defaults.bot_identity`. This makes the work visible to
+other actors (humans in the GH UI, other dispatch instances on other
+machines) and prevents double-pickup.
+
+The claim protocol:
+
+1. GET the issue. If state is `closed`, transition the ticket to
+   `gh-resolved` and skip — the issue has already been resolved.
+2. If the issue is already assigned to someone other than `bot_identity`,
+   transition to `lost-race`, append a vault comment naming the
+   existing assignees, and skip.
+3. PATCH `assignees: [bot_identity]`. Re-read the response.
+4. If the response shows assignees empty, the operator's `gh` token
+   doesn't have push access on the repo (GitHub silently drops assignee
+   changes without it). Leave the ticket `green-lit` so the next tick
+   can retry, and surface the error.
+5. If the response shows a different sole assignee, another writer
+   raced us; treat as `already-claimed` and skip.
+6. Otherwise the claim is held; proceed to spawn `oteam assign`.
+
+`bot_identity` is whatever GitHub login should hold the claim. The
+operator's own login is the simplest choice; a dedicated bot account
+works if you want to disambiguate human vs. automated claims in the
+GH UI. The login must be a valid assignee on every repo in fire mode
+(i.e. a collaborator).
 
 ### Routing model
 
