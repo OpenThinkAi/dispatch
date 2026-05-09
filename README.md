@@ -58,8 +58,9 @@ ln -s "$PWD/bin/dispatch" ~/.local/bin/dispatch
 # edit your config
 $EDITOR ~/.config/dispatch/dispatch.toml
 
-# verify and smoke-test before bootstrapping the timer
+# verify before bootstrapping the timer
 dispatch config validate
+dispatch smoketest                      # preflight every external integration
 dispatch process https://github.com/<your-org>/<your-repo>/issues/<n>
 # (no API key needed if Claude Code is logged in)
 
@@ -164,11 +165,46 @@ project = "critical-thing-launch"   # must exist
 can_label = true
 ```
 
+## Verifying the pipeline
+
+The pipeline has multiple independently-driftable integrations (gh CLI auth,
+oteam CLI on PATH, Claude triage model, Claude curator model, vault
+project registration). When something breaks, issues silently stop
+appearing in the vault and the failure can go undetected for days.
+
+`dispatch smoketest` exercises every one of those integrations against a
+synthetic in-memory issue and reports a stage-by-stage pass/fail. It does
+**not** write to any vault and does **not** modify any GitHub issue —
+it's safe to run any time.
+
+```sh
+dispatch smoketest
+```
+
+Run it after:
+
+- a model upgrade (`triage_model` or `curator_model` change in your config)
+- an `oteam` version bump
+- an `@openthink/dispatch` version bump (`dispatch update`)
+- `dispatch setup --force` (re-renders the launchd plist's PATH; can drop tools)
+- any change to the triage or curator prompt
+
+Stages covered: tools on PATH, `gh auth status`, config load, vault project
+index, triage SDK call (returns valid JSON shape), curator SDK call (returns
+valid decision shape). The two SDK stages cost a small amount per run
+(~$0.01–0.03 combined depending on model); the cost is reported back.
+
+**Coverage gap (acknowledged):** `oteam pull github` and
+`gh issue edit --add-label` are *not* exercised — both have unavoidable
+side effects. For full vault-write verification, run
+`dispatch process <url>` against a known issue with a scratch vault.
+
 ## Day-to-day
 
 | Situation | What you do |
 | --- | --- |
 | Add or remove a repo | edit `dispatch.toml`; next tick picks it up — no restart |
+| Verify the pipeline is healthy | `dispatch smoketest` |
 | Issue didn't get filed | `tail -f ~/Library/Logs/dispatch/stdout.log` |
 | Manually triage one issue | `dispatch process <url>` |
 | See what's been processed | `dispatch state show` |
