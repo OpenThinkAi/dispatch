@@ -4,6 +4,7 @@ import { log } from "./log.ts";
 import { fetchIssue, parseIssueRef } from "./github.ts";
 import { pollOnce, processIssue } from "./poll.ts";
 import { runSetup } from "./setup.ts";
+import { runSmoketest } from "./smoketest.ts";
 import { State } from "./state.ts";
 import { runView } from "./view.ts";
 import { runUpdate } from "./update.ts";
@@ -17,6 +18,10 @@ Commands:
   poll                       One-shot: ingest, curate, orchestrate
   watch [--interval SEC]     Foreground loop calling poll (default 300s); for dev/debug
   process <url-or-ref>       Manually ingest one issue (does NOT trigger curation)
+  smoketest                  Exercise every external integration (gh, oteam, Claude SDK
+                             triage + curator) against a synthetic fixture. No vault
+                             writes, no GH issue mutations. Run after a model upgrade,
+                             oteam version bump, or \`dispatch setup --force\`.
   config validate            Parse config + cross-check vault projects; exit non-zero on failure
   config path                Print resolved config path
   state show                 Print cursors, recent processed issues, recent curator decisions
@@ -164,6 +169,10 @@ async function main(argv: string[]): Promise<number> {
       const intervalSec = intervalArg ? Number(intervalArg.split("=")[1]) : 300;
       runSetup({ force, intervalSec, dryRun, createLabels });
       return 0;
+    }
+
+    case "smoketest": {
+      return runSmoketest();
     }
 
     case "view": {
