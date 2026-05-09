@@ -289,6 +289,15 @@ export async function runView(): Promise<number> {
     view: "log-stream",
     viewsRoot,
     data: { entries: [], startedAt: STARTED_AT, latestPoll: null },
+    // ui-leaf's default heartbeat timeout is 5s, which kills backgrounded
+    // browser tabs almost immediately (Chrome throttles backgrounded
+    // setInterval to ~once per minute, so a 5s server-side window is
+    // unsurvivable). dispatch view is a long-monitoring use case, so we
+    // extend to 5 minutes — well above Chrome's throttle interval and
+    // common system-sleep windows. The trade-off is a longer zombie
+    // session if the tab is closed without a clean shutdown, which is
+    // fine for an operator dashboard.
+    heartbeatTimeoutMs: 300_000,
   });
 
   console.error(`[dispatch view] ready at ${viewHandle.url}`);
