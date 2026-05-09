@@ -1,7 +1,10 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
+import { STANDARD_LABEL_NAMES } from "./labels-standard.ts";
 import type { GitHubIssue, RepoConfig, SecurityFlag, TriageResult } from "./types.ts";
 
 const SECURITY_KINDS: SecurityFlag["kind"][] = ["secret-leak", "vuln-disclosure", "pii", "abuse"];
+
+const STANDARD_LABEL_LIST = STANDARD_LABEL_NAMES.map(n => `"${n}"`).join(", ");
 
 const SYSTEM_PROMPT = `You are an issue-triage assistant for a GitHub-issue ingestion pipeline.
 
@@ -9,7 +12,7 @@ For each issue, return a strict JSON object with these fields:
 - summary: one-line plain-English summary of the issue (<=140 chars).
 - reasoning: one or two sentences explaining your classification choices.
 - security_flag: null, OR { "kind": <one of "secret-leak" | "vuln-disclosure" | "pii" | "abuse">, "reason": short explanation } if the issue body appears to leak secrets/tokens, disclose a vulnerability that should be handled in a private channel rather than the public issue, expose personally identifiable information about a real person, or constitute abuse/spam.
-- labels_to_add: array of GitHub labels to apply (lower-case kebab-case). Pick from a small standard set: "bug", "feature", "enhancement", "docs", "question", "needs-info", "duplicate", "p0", "p1", "p2", "p3". Only include labels you are confident about. Empty array is fine.
+- labels_to_add: array of GitHub labels to apply (lower-case kebab-case). Pick from a small standard set: ${STANDARD_LABEL_LIST}. Only include labels you are confident about. Empty array is fine.
 
 Rules:
 - Be conservative on security_flag. Setting it skips the public vault and routes to a private inbox; only set it if there is a real signal (an actual token-shaped string, an explicit vulnerability disclosure, real PII, or clear abuse).

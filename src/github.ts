@@ -77,6 +77,40 @@ export function addLabels(slug: string, number: number, labels: string[]): void 
   if (!r.ok) throw new Error(`gh add-labels failed for ${slug}#${number}: ${r.stderr}`);
 }
 
+/** List repo-level label definitions (not labels on a particular issue). */
+export function listLabels(slug: string): { name: string }[] {
+  const r = gh([
+    "label", "list",
+    "--repo", slug,
+    "--json", "name",
+    "--limit", "200",
+  ]);
+  if (!r.ok) throw new Error(`gh label list failed for ${slug}: ${r.stderr}`);
+  let arr: unknown;
+  try { arr = JSON.parse(r.stdout); } catch (e) {
+    throw new Error(`gh label list returned non-JSON for ${slug}: ${(e as Error).message}`);
+  }
+  if (!Array.isArray(arr)) throw new Error(`gh label list returned non-array for ${slug}`);
+  return arr.filter((l): l is { name: string } =>
+    !!l && typeof (l as { name?: unknown }).name === "string"
+  );
+}
+
+/** Create a single repo label. Throws on any gh failure (including "already exists");
+ *  callers should pre-diff against `listLabels` to keep this idempotent. */
+export function createLabel(
+  slug: string,
+  label: { name: string; color: string; description: string },
+): void {
+  const r = gh([
+    "label", "create", label.name,
+    "--repo", slug,
+    "--color", label.color,
+    "--description", label.description,
+  ]);
+  if (!r.ok) throw new Error(`gh label create failed for ${slug} "${label.name}": ${r.stderr}`);
+}
+
 /** List currently-open issues on a repo (excluding PRs), capped. Used as curator context. */
 export function listOpenIssues(slug: string, cap = 50): GitHubIssue[] {
   const r = gh([
