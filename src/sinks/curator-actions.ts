@@ -106,9 +106,16 @@ export function spawnOteamAssign(ticketPath: string, logDir: string): { ok: true
     if (typeof child.pid !== "number") {
       return { ok: false, error: "spawned but no pid returned" };
     }
+    // Emit the AGT-NNN ID as `ticket` (matching every other dispatch log
+     // line), with the full path as a separate `ticket_path` field.
+     // Earlier this emission used `ticket: ticketPath`, which made
+     // downstream consumers (the dispatch view feed, log greps) display a
+     // truncated file path where the AGT-ID was expected.
+    const ticketId = ticketPath.split("/").pop()?.match(/^(AGT-\d+)-/)?.[1] ?? null;
     log.info("orchestrator spawned oteam assign", {
       pid: child.pid,
-      ticket: ticketPath,
+      ticket: ticketId,
+      ticket_path: ticketPath,
       log_hint: logPath,
     });
     return { ok: true, pid: child.pid };

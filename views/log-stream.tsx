@@ -87,7 +87,8 @@ function levelColor(level: LogEntry["level"]): string {
 function eventClass(msg: string, source: string): string {
   if (source === "telemetry") return "phase";
   if (msg.startsWith("issue ")) return "ingest";
-  if (msg.includes("orchestrator spawned")) return "fire";
+  if (msg.startsWith("drive:") || msg.startsWith("driving row")) return "drive";
+  if (msg.includes("orchestrator spawned")) return "spawn";
   if (msg.startsWith("curator action:")) return "curator";
   if (msg.startsWith("poll complete")) return "poll";
   return "system";
@@ -96,7 +97,8 @@ function eventClass(msg: string, source: string): string {
 function eventClassColor(cls: string): string {
   switch (cls) {
     case "ingest": return COLORS.success;
-    case "fire": return COLORS.ticket;
+    case "spawn": return COLORS.ticket;
+    case "drive": return COLORS.warn;
     case "phase": return COLORS.info;
     case "curator": return COLORS.warn;
     case "poll": return COLORS.muted;
