@@ -58,7 +58,7 @@ ln -s "$PWD/bin/dispatch" ~/.local/bin/dispatch
 # edit your config
 $EDITOR ~/.config/dispatch/dispatch.toml
 
-# verify and smoke-test before bootstrapping the timer
+# verify before bootstrapping the timer
 dispatch config validate
 dispatch smoketest                      # preflight every external integration
 dispatch process https://github.com/<your-org>/<your-repo>/issues/<n>
