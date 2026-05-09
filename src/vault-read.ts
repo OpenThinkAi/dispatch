@@ -3,13 +3,25 @@ import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { VaultTicketSummary } from "./types.ts";
 
-/** Resolve a registered vault name to its absolute path via oteam config. */
+/** Resolve a registered vault name to its absolute path via oteam config.
+ *
+ * `oteam config vault list` emits whitespace-separated `<name>  <path>`
+ * pairs with an optional ` (default)` annotation on the default vault.
+ * The parser was previously written against an older format that used a
+ * Unicode `→` separator; when oteam dropped the arrow, every match
+ * silently returned null and the curator's `vaultTicketPath()` lookup
+ * collapsed — autopilot stopped working entirely until this was caught.
+ *
+ * Match shape: leading whitespace, vault name (no spaces), whitespace,
+ * absolute path starting with `/`, then anything (including a trailing
+ * `(default)` annotation we ignore).
+ */
 export function resolveVaultPath(vault: string): string | null {
   const r = spawnSync("oteam", ["config", "vault", "list"], { encoding: "utf-8" });
   if (r.status !== 0) return null;
   for (const line of r.stdout.split("\n")) {
-    const m = line.match(/^\s*(\S+)\s+→\s+(\/.+)$/);
-    if (m && m[1] === vault) return m[2];
+    const m = line.match(/^\s*(\S+)\s+(\/\S+)/);
+    if (m && m[1] === vault) return m[2]!;
   }
   return null;
 }
