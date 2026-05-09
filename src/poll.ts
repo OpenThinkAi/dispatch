@@ -1,4 +1,4 @@
-import { existsSync, readdirSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { claimIssue, listIssuesSince } from "./github.ts";
 import { log } from "./log.ts";
@@ -78,6 +78,9 @@ export async function pollOnce(cfg: Config): Promise<PollSummary> {
 
     // ── Phase B+C: curate, then orchestrate ──────────────────────────────
     await curateAndOrchestrate(cfg, state, summary);
+
+    // ── Phase D: drive in-flight tickets through the role pipeline ───────
+    driveInFlight(cfg, state, summary);
   } finally {
     state.close();
   }
@@ -180,7 +183,7 @@ async function curateAndOrchestrate(cfg: Config, state: State, summary: PollSumm
         continue;
       }
       // action === "fire"
-      if (repo.autopilot !== "fire") {
+      if (repo.autopilot === "curate-only") {
         // Curator green-lit, but the repo's autopilot is curate-only.
         // Mark green-lit so a future tick (or manual flip) can fire it.
         appendVaultComment(
@@ -191,6 +194,10 @@ async function curateAndOrchestrate(cfg: Config, state: State, summary: PollSumm
         state.setTriageStatus(row.slug, row.number, "green-lit");
         continue;
       }
+      // autopilot is "fire" or "drive" — both proceed to spawn the
+      // first phase. The two modes diverge at the post-spawn bookkeeping
+      // below: "fire" terminates after one phase, "drive" transitions to
+      // "driving" so the drive loop continues firing subsequent phases.
       if (spawnsThisTick >= maxSpawns) {
         log.info("orchestrator spawn cap reached; deferring fire to next tick", {
           slug: row.slug,
@@ -250,9 +257,17 @@ async function curateAndOrchestrate(cfg: Config, state: State, summary: PollSumm
       appendVaultComment(
         ticketPath,
         "Curator",
-        `**Curator decision:** fire (autopilot=fire, oteam assign spawned pid=${spawn.pid})\n\n${decision.reasoning}`
+        `**Curator decision:** fire (autopilot=${repo.autopilot}, oteam assign spawned pid=${spawn.pid})\n\n${decision.reasoning}`
       );
-      state.setTriageStatus(row.slug, row.number, "fired");
+      // autopilot=fire stops here (one phase only). autopilot=drive transitions
+      // to "driving" so the drive loop watches subsequent phases.
+      if (repo.autopilot === "drive") {
+        const initial = readVaultTicketState(ticketPath) ?? "triage";
+        state.setTriageStatus(row.slug, row.number, "driving");
+        state.setLastFiredForState(row.slug, row.number, initial);
+      } else {
+        state.setTriageStatus(row.slug, row.number, "fired");
+      }
       summary.fired += 1;
       spawnsThisTick += 1;
     } catch (e) {
@@ -272,7 +287,7 @@ function vaultTicketPath(_state: State, vault: string, row: { vault_ticket_id: s
   const vaultPath = resolveVaultPath(vault);
   if (!vaultPath) return null;
   // Search the standard ticket folders for a file matching <ID>-*.md.
-  const folders = ["triage", "refined", "in-progress", "qa"];
+  const folders = ["triage", "refined", "in-progress", "qa", "blocked"];
   for (const folder of folders) {
     const dir = join(vaultPath, "tickets", folder);
     let entries: string[];
@@ -283,7 +298,161 @@ function vaultTicketPath(_state: State, vault: string, row: { vault_ticket_id: s
       if (existsSync(candidate)) return candidate;
     }
   }
+  // Also search archive subdirs (organized as archive/<YYYY-MM>/<ID>-*.md).
+  const archiveRoot = join(vaultPath, "tickets", "archive");
+  let monthDirs: string[];
+  try { monthDirs = readdirSync(archiveRoot); } catch { return null; }
+  for (const month of monthDirs) {
+    const dir = join(archiveRoot, month);
+    let entries: string[];
+    try { entries = readdirSync(dir); } catch { continue; }
+    const match = entries.find(n => n.startsWith(`${row.vault_ticket_id}-`) && n.endsWith(".md"));
+    if (match) {
+      const candidate = join(dir, match);
+      if (existsSync(candidate)) return candidate;
+    }
+  }
   return null;
+}
+
+/** Read the YAML frontmatter `state:` field from a vault ticket. */
+function readVaultTicketState(ticketPath: string): string | null {
+  let text: string;
+  try { text = readFileSync(ticketPath, "utf-8"); } catch { return null; }
+  // Frontmatter is delimited by --- on the first line and the next ---.
+  if (!text.startsWith("---\n")) return null;
+  const end = text.indexOf("\n---", 4);
+  if (end < 0) return null;
+  const fm = text.slice(4, end);
+  const m = fm.match(/^state:\s*(\S+)\s*$/m);
+  return m ? m[1]! : null;
+}
+
+/** Map a vault ticket state to the next phase's expected starting state.
+ * dispatch fires `oteam assign --inline` repeatedly; each call runs the
+ * role-agent for the ticket's current state. Returns null when the
+ * ticket is at a terminal state (done/archive) or in a held state
+ * (blocked) — the drive loop short-circuits on those. */
+function isTerminalVaultState(state: string): boolean {
+  return state === "done" || state === "archive";
+}
+
+const STUCK_THRESHOLD_MS = 60 * 60 * 1000; // 60 min
+
+function driveInFlight(cfg: Config, state: State, summary: PollSummary): void {
+  const inFlight = state.listByStatus("driving", 100);
+  if (inFlight.length === 0) return;
+
+  let spawnsThisTick = summary.fired;
+  const maxSpawns = cfg.defaults.max_orchestrator_spawns_per_tick;
+
+  for (const row of inFlight) {
+    const repo = cfg.repos.find(r => r.slug.toLowerCase() === row.slug.toLowerCase());
+    if (!repo) {
+      log.warn("driving row references repo not in config; skipping", { slug: row.slug, number: row.number });
+      continue;
+    }
+    if (repo.autopilot !== "drive") {
+      // Operator must have flipped the repo's autopilot mid-flight. Leave
+      // the row alone — they'll need to clean it up manually if they want.
+      continue;
+    }
+
+    const ticketPath = vaultTicketPath(state, repo.vault, row);
+    if (!ticketPath) {
+      log.error("driving row: vault ticket file gone; marking pipeline-held", {
+        slug: row.slug,
+        number: row.number,
+        vault_ticket_id: row.vault_ticket_id,
+      });
+      state.setTriageStatus(row.slug, row.number, "pipeline-held");
+      summary.errors += 1;
+      continue;
+    }
+
+    const currentState = readVaultTicketState(ticketPath);
+    if (!currentState) {
+      log.error("driving row: could not read state from frontmatter", {
+        slug: row.slug,
+        number: row.number,
+        ticket_path: ticketPath,
+      });
+      continue;
+    }
+
+    if (isTerminalVaultState(currentState) || ticketPath.includes("/tickets/archive/")) {
+      log.info("driving row: pipeline complete", {
+        slug: row.slug,
+        number: row.number,
+        ticket: row.vault_ticket_id,
+        final_state: currentState,
+      });
+      state.setTriageStatus(row.slug, row.number, "pipeline-complete");
+      continue;
+    }
+
+    if (currentState === "blocked") {
+      log.info("driving row: ticket blocked; marking pipeline-held", {
+        slug: row.slug,
+        number: row.number,
+        ticket: row.vault_ticket_id,
+      });
+      state.setTriageStatus(row.slug, row.number, "pipeline-held");
+      continue;
+    }
+
+    if (currentState === row.last_fired_for_state) {
+      // Phase still in flight (or pause-point holding the agent's state
+      // unchanged). Surface as stuck only if it's been a while.
+      const sinceFire = Date.now() - new Date(row.last_processed_at).getTime();
+      if (sinceFire > STUCK_THRESHOLD_MS) {
+        log.warn("driving row: stuck (no state advance)", {
+          slug: row.slug,
+          number: row.number,
+          ticket: row.vault_ticket_id,
+          state: currentState,
+          minutes_since_fire: Math.round(sinceFire / 60000),
+        });
+      }
+      continue;
+    }
+
+    // State advanced — fire the next phase.
+    if (spawnsThisTick >= maxSpawns) {
+      log.info("drive: spawn cap reached; deferring next phase to next tick", {
+        slug: row.slug,
+        number: row.number,
+        ticket: row.vault_ticket_id,
+        state: currentState,
+      });
+      continue;
+    }
+
+    const spawn = spawnOteamAssign(ticketPath, cfg.defaults.log_dir);
+    if (!spawn.ok) {
+      log.error("drive: oteam assign re-spawn failed", {
+        slug: row.slug,
+        number: row.number,
+        ticket: row.vault_ticket_id,
+        state: currentState,
+        error: spawn.error,
+      });
+      summary.errors += 1;
+      continue;
+    }
+
+    log.info("drive: fired next phase", {
+      slug: row.slug,
+      number: row.number,
+      ticket: row.vault_ticket_id,
+      state: currentState,
+      previous_state: row.last_fired_for_state,
+      pid: spawn.pid,
+    });
+    state.setLastFiredForState(row.slug, row.number, currentState);
+    summary.fired += 1;
+    spawnsThisTick += 1;
+  }
 }
 
 export async function processIssue(args: {

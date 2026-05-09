@@ -12,6 +12,10 @@ export type SeenRow = {
   triage_status: TriageStatus;
   first_processed_at: string;
   last_processed_at: string;
+  /** Vault ticket `state:` field at the time dispatch last fired
+   * `oteam assign` for this row. NULL until the first fire. Used by the
+   * drive loop to detect phase advances (current state != last_fired_for_state). */
+  last_fired_for_state: string | null;
 };
 
 export type CuratorDecisionRow = {
@@ -60,14 +64,19 @@ export class State {
     `);
 
     // Migrate: add triage_status column if missing.
-    const hasTriageStatus = this.db
+    const seenCols = this.db
       .query<{ name: string }, []>("PRAGMA table_info(seen)")
-      .all()
-      .some(c => c.name === "triage_status");
+      .all();
+    const hasTriageStatus = seenCols.some(c => c.name === "triage_status");
     if (!hasTriageStatus) {
       this.db.exec(
         `ALTER TABLE seen ADD COLUMN triage_status TEXT NOT NULL DEFAULT 'awaiting-curation';`
       );
+    }
+    // Migrate: add last_fired_for_state column for drive-mode tracking.
+    const hasLastFiredForState = seenCols.some(c => c.name === "last_fired_for_state");
+    if (!hasLastFiredForState) {
+      this.db.exec(`ALTER TABLE seen ADD COLUMN last_fired_for_state TEXT;`);
     }
 
     this.cursorsPath = join(stateDir, "cursors.json");
@@ -132,6 +141,16 @@ export class State {
     this.db.run(
       `UPDATE seen SET triage_status = ?, last_processed_at = ? WHERE slug = ? AND number = ?`,
       [status, now, slug, number]
+    );
+  }
+
+  /** Record the vault ticket state we just fired against. Drive-mode reads
+   * this each tick to decide whether the ticket has advanced. */
+  setLastFiredForState(slug: string, number: number, vaultState: string): void {
+    const now = new Date().toISOString();
+    this.db.run(
+      `UPDATE seen SET last_fired_for_state = ?, last_processed_at = ? WHERE slug = ? AND number = ?`,
+      [vaultState, now, slug, number]
     );
   }
 

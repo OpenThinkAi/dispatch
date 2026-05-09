@@ -1,6 +1,6 @@
-export type Autopilot = "off" | "curate-only" | "fire";
+export type Autopilot = "off" | "curate-only" | "fire" | "drive";
 
-export const AUTOPILOT_VALUES: Autopilot[] = ["off", "curate-only", "fire"];
+export const AUTOPILOT_VALUES: Autopilot[] = ["off", "curate-only", "fire", "drive"];
 
 export type RepoConfig = {
   slug: string;
@@ -86,8 +86,15 @@ export type ProcessOutcome =
  *                                                          │
  *                                                          │ orchestrator picks up
  *                                                          ↓
- *                                                        fired ─── monitored ──→ completed
- *                                                                              └→ failed
+ *                                                  ┌── autopilot=fire  ──→ fired (terminal — one phase only)
+ *                                                  │
+ *                                                  └── autopilot=drive ──→ driving ── role pipeline ──┐
+ *                                                                            │                       │
+ *                                                                            ├─ (state advances)     │ each tick
+ *                                                                            │                       │ re-fires next phase
+ *                                                                            ├─ (state=done/archive) ─→ pipeline-complete (terminal good)
+ *                                                                            │
+ *                                                                            └─ (state=blocked or stuck >60min) ─→ pipeline-held (terminal until human acts)
  */
 export type TriageStatus =
   | "awaiting-curation"
@@ -95,6 +102,9 @@ export type TriageStatus =
   | "held-for-human"
   | "gh-resolved"
   | "fired"
+  | "driving"
+  | "pipeline-complete"
+  | "pipeline-held"
   | "completed"
   | "failed"
   | "lost-race";
@@ -105,6 +115,9 @@ export const TRIAGE_STATUS_VALUES: TriageStatus[] = [
   "held-for-human",
   "gh-resolved",
   "fired",
+  "driving",
+  "pipeline-complete",
+  "pipeline-held",
   "completed",
   "failed",
   "lost-race",
