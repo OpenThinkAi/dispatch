@@ -328,11 +328,9 @@ function readVaultTicketState(ticketPath: string): string | null {
   return m ? m[1]! : null;
 }
 
-/** Map a vault ticket state to the next phase's expected starting state.
- * dispatch fires `oteam assign --inline` repeatedly; each call runs the
- * role-agent for the ticket's current state. Returns null when the
- * ticket is at a terminal state (done/archive) or in a held state
- * (blocked) — the drive loop short-circuits on those. */
+/** True when the ticket has reached a terminal vault state and the drive
+ * loop should stop watching. Note that `blocked` is NOT terminal here —
+ * it has its own dedicated transition to pipeline-held in the drive loop. */
 function isTerminalVaultState(state: string): boolean {
   return state === "done" || state === "archive";
 }
@@ -353,8 +351,15 @@ function driveInFlight(cfg: Config, state: State, summary: PollSummary): void {
       continue;
     }
     if (repo.autopilot !== "drive") {
-      // Operator must have flipped the repo's autopilot mid-flight. Leave
-      // the row alone — they'll need to clean it up manually if they want.
+      // Operator flipped the repo's autopilot mid-flight. Surface so the
+      // abandoned row is visible in logs; leave it in place for manual
+      // cleanup (we don't presume to know whether they want it killed).
+      log.info("driving row: repo no longer in drive mode; leaving for manual cleanup", {
+        slug: row.slug,
+        number: row.number,
+        ticket: row.vault_ticket_id,
+        current_autopilot: repo.autopilot,
+      });
       continue;
     }
 
@@ -402,17 +407,25 @@ function driveInFlight(cfg: Config, state: State, summary: PollSummary): void {
     }
 
     if (currentState === row.last_fired_for_state) {
-      // Phase still in flight (or pause-point holding the agent's state
-      // unchanged). Surface as stuck only if it's been a while.
+      // Phase still in flight (the agent for this state is presumably
+      // still running) OR the agent finished a phase that returned a
+      // pause-point without advancing state (spike plan review,
+      // implementation taste call, QA changes_requested). Either way we
+      // wait — but only up to the stuck threshold. Past that, transition
+      // to pipeline-held so the row leaves the active set and shows up
+      // in operator dashboards as needing attention. Self-quarantines
+      // rather than silently piling up.
       const sinceFire = Date.now() - new Date(row.last_processed_at).getTime();
       if (sinceFire > STUCK_THRESHOLD_MS) {
-        log.warn("driving row: stuck (no state advance)", {
+        log.warn("driving row: stuck past threshold; marking pipeline-held", {
           slug: row.slug,
           number: row.number,
           ticket: row.vault_ticket_id,
           state: currentState,
           minutes_since_fire: Math.round(sinceFire / 60000),
+          threshold_minutes: Math.round(STUCK_THRESHOLD_MS / 60000),
         });
+        state.setTriageStatus(row.slug, row.number, "pipeline-held");
       }
       continue;
     }
