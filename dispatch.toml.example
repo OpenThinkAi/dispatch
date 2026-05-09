@@ -5,7 +5,7 @@
 #   - which vault to file new issues into (must be registered with oteam)
 #   - which existing project gets the ticket (dispatch never auto-creates)
 #   - whether dispatch may write labels back to the GitHub issue
-#   - autopilot tier: off | curate-only | fire (see below)
+#   - autopilot tier: off | curate-only | fire | drive (see below)
 #
 # Tickets are filed via `oteam pull github <issue-url>`. The configured
 # vault must be registered (`oteam config vault list`) and the configured
@@ -28,13 +28,28 @@
 #                either closes the GH issue (clean dup), holds with comment, or
 #                green-lights. Green-lit tickets are NOT auto-fired in this mode.
 # fire         → curate AND, for green-lit tickets, autonomously fire `oteam assign`
-#                to drive the role pipeline. Most aggressive; reserve for repos
-#                where you fully trust the agent fleet to act unsupervised.
+#                ONCE — drives the ticket through the FIRST role-pipeline phase
+#                (Product) and stops. Subsequent phases (spike → implementation →
+#                qa) require manual `oteam assign` invocations or `/implement-project`.
+# drive        → like fire, but dispatch keeps watching the ticket and re-fires
+#                `oteam assign` on each phase advance until the ticket reaches a
+#                terminal vault state (done / archive / blocked). End-to-end
+#                unattended pipeline progression. Most autonomous tier; reserve
+#                for repos where you trust the agent fleet to act through QA
+#                without human review at any phase boundary.
 #
-# When any repo is in fire mode, dispatch claims the GH issue (sets `assignees`
-# to `defaults.bot_identity`) before invoking `oteam assign`. Other actors
-# (humans assigning themselves in the GH UI, other dispatch instances) cause
-# the claim to fail and the ticket transitions to `lost-race` instead of firing.
+# When any repo is in fire OR drive mode, dispatch claims the GH issue (sets
+# `assignees` to `defaults.bot_identity`) before invoking `oteam assign`. Other
+# actors (humans assigning themselves in the GH UI, other dispatch instances)
+# cause the claim to fail and the ticket transitions to `lost-race` instead of
+# firing.
+#
+# Drive-mode specifics: dispatch reads the vault ticket's frontmatter `state:`
+# field on every poll tick. State advances trigger the next phase's `oteam
+# assign` spawn. A ticket that sits in the same state for more than 60 minutes
+# transitions to `pipeline-held` so it leaves the active set and surfaces as
+# needing operator attention. `done` / `archive` states map to
+# `pipeline-complete`. `blocked` maps to `pipeline-held`.
 
 [defaults]
 state_dir                          = "~/.local/state/dispatch"
@@ -79,11 +94,25 @@ project   = "triage-inbox"
 can_label = false
 autopilot = "curate-only"
 
-# Full autopilot: curator green-lights → oteam assign fires automatically.
-# Reserve for low-stakes / well-tested repos.
+# Fire-once: curator green-lights → oteam assign fires the FIRST phase
+# (Product). Stops there. Subsequent phases need a human-attended
+# orchestrator (or /implement-project) to drive forward.
 [[repo]]
 slug      = "myorg/sandbox-toy"
 vault     = "my-vault"
 project   = "triage-inbox"
 can_label = true
 autopilot = "fire"
+
+# End-to-end drive: dispatch watches phase transitions and re-fires
+# oteam assign through Product → spike → implementation → qa → archive.
+# A ticket stuck in the same state for >60min self-quarantines into
+# `pipeline-held`. Most autonomous tier — reserve for repos where the
+# agent fleet is trusted to land changes without human review at any
+# phase boundary.
+[[repo]]
+slug      = "myorg/well-isolated-repo"
+vault     = "my-vault"
+project   = "triage-inbox"
+can_label = true
+autopilot = "drive"

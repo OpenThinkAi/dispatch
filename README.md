@@ -100,7 +100,23 @@ cadence, the model used for triage, and the body-truncate length passed
 to the model. Everything has reasonable defaults — most setups only need
 to add `[[repo]]` blocks.
 
-### Issue claims (autopilot = fire)
+### Autopilot tiers
+
+| Tier | What dispatch does |
+|---|---|
+| `off` (default) | Ingest only. Tickets sit in `triage` waiting for human action. |
+| `curate-only` | Also runs the curator. Curator dedupes, comments on dups, holds for human, or green-lights. **Green-lit tickets are not auto-fired.** |
+| `fire` | Curate AND fire `oteam assign` once on green-lit tickets. Drives the **first** role-pipeline phase (Product) and stops. Subsequent phases (spike → implementation → qa) require manual `oteam assign` or `/implement-project`. |
+| `drive` | Like `fire`, but dispatch keeps watching the ticket and re-fires `oteam assign` on each phase advance until the ticket reaches `done` / `archive` (→ `pipeline-complete`) or `blocked` / stuck >60min (→ `pipeline-held`). End-to-end unattended pipeline progression. |
+
+`fire` runs Product unattended, then hands off; `drive` runs the entire
+pipeline unattended. Pick `fire` when you want a Product evaluation
+auto-shaped on every issue but reserve all downstream judgment for a
+human-attended `/implement-project` session. Pick `drive` only on repos
+where you trust the agent fleet to land changes without human review at
+any phase boundary.
+
+### Issue claims (autopilot = fire or drive)
 
 When the curator decides to fire `oteam assign` on a green-lit ticket,
 dispatch first **claims the underlying GH issue** by setting its
@@ -127,8 +143,8 @@ The claim protocol:
 `bot_identity` is whatever GitHub login should hold the claim. The
 operator's own login is the simplest choice; a dedicated bot account
 works if you want to disambiguate human vs. automated claims in the
-GH UI. The login must be a valid assignee on every repo in fire mode
-(i.e. a collaborator).
+GH UI. The login must be a valid assignee on every repo in fire or
+drive mode (i.e. a collaborator).
 
 ### Routing model
 
