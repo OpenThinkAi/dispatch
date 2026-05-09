@@ -1,0 +1,87 @@
+name: Publish to npm
+
+# Fires when commits land on main (including via the stamp server's
+# post-receive mirror). Reads package.json's version, checks whether
+# that version is already on npm, and publishes via OIDC Trusted
+# Publishing if not. Non-bump merges no-op safely (the npm gate skips
+# when the version already exists).
+#
+# Auth: Trusted Publishing — no NPM_TOKEN secret. The npm package has a
+# Trusted Publisher binding configured at npmjs.com/package/@openthink/
+# dispatch/access pointing at this repo + this workflow filename. Renaming
+# this file requires reconfiguring the binding.
+#
+# Manual re-run: workflow_dispatch re-publishes whatever's in
+# package.json on main — useful for recovering from a transient publish
+# failure without burning a version bump.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Read version from package.json
+        id: version
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+            echo "could not read @openthink/dispatch version from package.json" >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "@openthink/dispatch version: $VERSION"
+
+      - name: Check if already on npm
+        id: check_npm
+        run: |
+          if npm view "@openthink/dispatch@${{ steps.version.outputs.version }}" version >/dev/null 2>&1; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+            echo "@openthink/dispatch@${{ steps.version.outputs.version }} already on npm — skipping publish."
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+            echo "@openthink/dispatch@${{ steps.version.outputs.version }} not on npm — proceeding."
+          fi
+
+      - name: Setup Node
+        if: steps.check_npm.outputs.published == 'false'
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      # GitHub-hosted runners ship npm 10.x at the time of writing, but
+      # OIDC Trusted Publishing on the npm registry requires npm 11.5+.
+      # An in-place `npm install -g npm@11` corrupts the global prefix
+      # mid-upgrade; install npm 11 to a fresh prefix and prepend that
+      # to PATH instead. Same workaround ui-leaf uses (lifted from its
+      # publish.yml).
+      - name: Install npm 11 to a fresh prefix
+        if: steps.check_npm.outputs.published == 'false'
+        run: |
+          mkdir -p "$HOME/.npm-global"
+          npm config set prefix "$HOME/.npm-global"
+          npm install -g npm@11
+          echo "$HOME/.npm-global/bin" >> "$GITHUB_PATH"
+
+      - name: Verify npm version
+        if: steps.check_npm.outputs.published == 'false'
+        run: |
+          which npm
+          npm --version
+
+      - name: Publish to npm with provenance
+        if: steps.check_npm.outputs.published == 'false'
+        run: npm publish --provenance --access public
