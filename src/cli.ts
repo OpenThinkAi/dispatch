@@ -6,6 +6,7 @@ import { pollOnce, processIssue } from "./poll.ts";
 import { runSetup } from "./setup.ts";
 import { State } from "./state.ts";
 import { runView } from "./view.ts";
+import { runUpdate } from "./update.ts";
 
 const HELP = `dispatch — GitHub-issue ingestion + triage router for oteam vaults
 
@@ -20,6 +21,7 @@ Commands:
   config path                Print resolved config path
   state show                 Print cursors, recent processed issues, recent curator decisions
   view                       Open a browser-based live event feed of dispatch + oteam telemetry
+  update                     Self-update to the latest @openthink/dispatch on npm; restart the daemon
   setup [--force] [--interval SEC] [--dry-run]
                              Detect machine, write the launchd plist, and seed config
   help                       Show this message
@@ -162,6 +164,10 @@ async function main(argv: string[]): Promise<number> {
 
     case "view": {
       return runView();
+    }
+
+    case "update": {
+      return runUpdate();
     }
 
     default:
