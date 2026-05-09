@@ -5,6 +5,7 @@ import { fetchIssue, parseIssueRef } from "./github.ts";
 import { pollOnce, processIssue } from "./poll.ts";
 import { runSetup } from "./setup.ts";
 import { State } from "./state.ts";
+import { runView } from "./view.ts";
 
 const HELP = `dispatch — GitHub-issue ingestion + triage router for oteam vaults
 
@@ -18,6 +19,7 @@ Commands:
   config validate            Parse config + cross-check vault projects; exit non-zero on failure
   config path                Print resolved config path
   state show                 Print cursors, recent processed issues, recent curator decisions
+  view                       Open a browser-based live event feed of dispatch + oteam telemetry
   setup [--force] [--interval SEC] [--dry-run]
                              Detect machine, write the launchd plist, and seed config
   help                       Show this message
@@ -156,6 +158,10 @@ async function main(argv: string[]): Promise<number> {
       const intervalSec = intervalArg ? Number(intervalArg.split("=")[1]) : 300;
       runSetup({ force, intervalSec, dryRun });
       return 0;
+    }
+
+    case "view": {
+      return runView();
     }
 
     default:
