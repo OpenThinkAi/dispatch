@@ -1,10 +1,18 @@
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
+import { userInfo } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const PACKAGE_NAME = "@openthink/dispatch";
-const LAUNCHD_LABEL = "com.mattpardini.dispatch";
+
+// The launchd label is per-user — setup.ts:33-34 writes the plist as
+// `com.<user>.dispatch` and the matching label inside it. Anything that
+// talks to launchctl (kickstart/bootout/list) must recompute the label
+// from the current user, never hardcode it.
+function launchdLabel(): string {
+  return `com.${userInfo().username}.dispatch`;
+}
 
 function currentVersion(): string {
   const here = dirname(fileURLToPath(import.meta.url));
@@ -32,14 +40,14 @@ function installLatest(): { ok: true } | { ok: false; error: string } {
   return { ok: true };
 }
 
-function restartLaunchd(): { ok: true } | { ok: false; error: string } {
-  const uid = process.getuid?.();
-  if (typeof uid !== "number") {
-    return { ok: false, error: "could not determine uid (non-POSIX?)" };
+function restartLaunchd(label: string): { ok: true } | { ok: false; error: string } {
+  if (process.platform !== "darwin") {
+    return { ok: false, error: "launchctl is macOS-only; skip daemon restart on this platform" };
   }
+  const uid = process.getuid!();
   const r = spawnSync(
     "launchctl",
-    ["kickstart", "-k", `gui/${uid}/${LAUNCHD_LABEL}`],
+    ["kickstart", "-k", `gui/${uid}/${label}`],
     { encoding: "utf-8" },
   );
   if (r.status !== 0) {
@@ -66,19 +74,20 @@ export function runUpdate(): number {
     return 0;
   }
 
-  process.stdout.write(`installing ${PACKAGE_NAME}@${latest.version}…\n`);
+  process.stdout.write(`installing ${PACKAGE_NAME}@${latest.version}...\n`);
   const installed = installLatest();
   if (!installed.ok) {
     console.error(`install failed: ${installed.error}`);
     return 1;
   }
 
-  process.stdout.write(`restarting launchd service ${LAUNCHD_LABEL}…\n`);
-  const restarted = restartLaunchd();
+  const label = launchdLabel();
+  process.stdout.write(`restarting launchd service ${label}...\n`);
+  const restarted = restartLaunchd(label);
   if (!restarted.ok) {
     process.stdout.write(
       `note: could not restart daemon (${restarted.error}). ` +
-        `Run 'launchctl kickstart -k gui/$(id -u)/${LAUNCHD_LABEL}' manually if needed.\n`,
+        `Run 'launchctl kickstart -k gui/$(id -u)/${label}' manually if needed.\n`,
     );
     return 0;
   }
