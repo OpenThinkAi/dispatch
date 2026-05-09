@@ -1,6 +1,6 @@
 {
   "name": "@openthink/dispatch",
-  "version": "0.0.6",
+  "version": "0.0.7",
   "private": false,
   "description": "Auto-route GitHub issues into OpenThink vaults via oteam. Part of the OpenThink suite.",
   "homepage": "https://github.com/OpenThinkAi/dispatch",

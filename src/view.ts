@@ -24,6 +24,14 @@ const RELEVANT_DISPATCH_MSGS = new Set<string>([
   "poll complete",
 ]);
 
+/** Drive-loop events all start with "drive:" or "driving row:" — match by
+ * prefix so new drive-loop log lines auto-include without churning the
+ * filter set. These events carry phase-transition context (state,
+ * previous_state) the operator wants to see in the feed. */
+function isDriveMsg(msg: string): boolean {
+  return msg.startsWith("drive:") || msg.startsWith("driving row");
+}
+
 // Seed window: only ingest the last N lines per file at startup. Anything
 // older than this is hidden by default; the live tail picks up from there.
 const SEED_LINES_PER_FILE = 80;
@@ -134,6 +142,21 @@ function scheduleUpdate() {
   }, 100);
 }
 
+/** Older dispatch versions (before the curator-actions fix) emitted the
+ * full ticket file path as `obj.ticket` for "orchestrator spawned" events
+ * instead of the AGT-NNN. Pull the AGT-NNN out of a path-shaped value as
+ * a fallback so the view's ticket column doesn't show truncated paths
+ * for log entries written by older daemons. */
+function normalizeTicket(raw: unknown): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  if (raw.startsWith("AGT-")) return raw;
+  if (raw.startsWith("/")) {
+    const m = raw.split("/").pop()?.match(/^(AGT-\d+)-/);
+    return m ? m[1] : undefined;
+  }
+  return raw;
+}
+
 function ingestDispatchLine(raw: string) {
   const trimmed = raw.trim();
   if (!trimmed) return;
@@ -144,7 +167,7 @@ function ingestDispatchLine(raw: string) {
     return;
   }
   const rawMsg = typeof obj.msg === "string" ? obj.msg : "";
-  if (!RELEVANT_DISPATCH_MSGS.has(rawMsg)) return;
+  if (!RELEVANT_DISPATCH_MSGS.has(rawMsg) && !isDriveMsg(rawMsg)) return;
 
   const ts = typeof obj.ts === "string" ? obj.ts : new Date().toISOString();
   const level = obj.level === "error" || obj.level === "warn" ? (obj.level as Level) : "info";
@@ -169,12 +192,23 @@ function ingestDispatchLine(raw: string) {
     }
   }
 
+  // Drive-loop transitions carry phase context (state, previous_state).
+  // Inline that into the display so operators can see "agent advanced
+  // refined → in-progress" at a glance instead of just "drive: fired
+  // next phase".
+  if (rawMsg === "drive: fired next phase") {
+    const cur = typeof obj.state === "string" ? obj.state : null;
+    const prev = typeof obj.previous_state === "string" ? obj.previous_state : null;
+    if (prev && cur) displayMsg = `drive: re-fired (${prev} → ${cur})`;
+    else if (cur) displayMsg = `drive: re-fired (${cur})`;
+  }
+
   pushOrCollapse({
     ts,
     level,
     source: "dispatch",
     msg: displayMsg,
-    ticket: typeof obj.ticket === "string" ? obj.ticket : undefined,
+    ticket: normalizeTicket(obj.ticket),
     slug: typeof obj.slug === "string" ? obj.slug : undefined,
     number: typeof obj.number === "number" ? obj.number : undefined,
   });
