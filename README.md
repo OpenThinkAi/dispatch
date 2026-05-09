@@ -268,8 +268,14 @@ bin/dispatch          # bash shim → bun src/cli.ts
   `https://github.com/owner/repo/issues/N`.** If your version of `oteam`
   expects a different ref form, the vault sink will need adjustment.
 - **`gh issue edit --add-label` requires the label to exist on the repo.**
-  Triage suggests labels from a small standard set; if the repo doesn't
-  have those labels, the apply silently fails (logged as a warning).
+  Triage suggests labels from a small standard set (`bug`, `feature`,
+  `enhancement`, `docs`, `question`, `needs-info`, `duplicate`,
+  `p0`–`p3`); if the repo doesn't have those labels, the apply silently
+  fails (logged as a warning). Run `dispatch setup --create-labels` to
+  create the standard set on every `can_label=true` repo. The command is
+  idempotent — it diffs against existing labels and only creates the
+  missing ones, so it's safe to re-run and won't overwrite operator-
+  customized colors or descriptions.
 - **The launchd plist's PATH is rendered once at `dispatch setup` time.**
   If you switch node versions via nvm, or move `bun`/`gh`/`claude`/`oteam`
   to a different prefix, re-run `dispatch setup --force` to regenerate.

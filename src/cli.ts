@@ -22,8 +22,10 @@ Commands:
   state show                 Print cursors, recent processed issues, recent curator decisions
   view                       Open a browser-based live event feed of dispatch + oteam telemetry
   update                     Self-update to the latest @openthink/dispatch on npm; restart the daemon
-  setup [--force] [--interval SEC] [--dry-run]
-                             Detect machine, write the launchd plist, and seed config
+  setup [--force] [--interval SEC] [--dry-run] [--create-labels]
+                             Detect machine, write the launchd plist, and seed config.
+                             --create-labels also creates the standard 11-label
+                             set on every can_label=true repo (idempotent).
   help                       Show this message
 
 Environment:
@@ -154,11 +156,13 @@ async function main(argv: string[]): Promise<number> {
     }
 
     case "setup": {
-      const force = rest.includes("--force") || sub === "--force";
-      const dryRun = rest.includes("--dry-run") || sub === "--dry-run";
-      const intervalArg = [sub, ...rest].find(a => a?.startsWith("--interval="));
+      const args = [sub, ...rest];
+      const force = args.includes("--force");
+      const dryRun = args.includes("--dry-run");
+      const createLabels = args.includes("--create-labels");
+      const intervalArg = args.find(a => a?.startsWith("--interval="));
       const intervalSec = intervalArg ? Number(intervalArg.split("=")[1]) : 300;
-      runSetup({ force, intervalSec, dryRun });
+      runSetup({ force, intervalSec, dryRun, createLabels });
       return 0;
     }
 

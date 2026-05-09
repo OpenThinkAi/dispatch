@@ -2,7 +2,8 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, copyFileSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { configPath } from "./config.ts";
+import { configPath, loadConfig } from "./config.ts";
+import { ensureStandardLabels } from "./sinks/labels.ts";
 
 type Detected = {
   user: string;
@@ -90,6 +91,7 @@ export type SetupOptions = {
   force?: boolean;
   intervalSec?: number;
   dryRun?: boolean;
+  createLabels?: boolean;
 };
 
 export function runSetup(opts: SetupOptions = {}): void {
@@ -137,7 +139,52 @@ export function runSetup(opts: SetupOptions = {}): void {
     console.log(`  → ${tag}write ${d.plistPath}`);
   }
 
-  // 4. PATH check on shim
+  // 4. Optional: create the standard label set on every can_label=true repo.
+  if (opts.createLabels) {
+    console.log("");
+    console.log("Creating standard label set on can_label=true repos:");
+    let cfg;
+    try {
+      cfg = loadConfig();
+    } catch (e) {
+      console.error(`  ! could not load config: ${(e as Error).message}`);
+      console.error(`    --create-labels needs a valid config; fix the above and re-run.`);
+      return;
+    }
+    const targets = cfg.repos.filter(r => r.can_label);
+    const skipped = cfg.repos.filter(r => !r.can_label);
+    for (const repo of skipped) {
+      console.log(`  • ${repo.slug.padEnd(40)} skipped (can_label=false)`);
+    }
+    if (targets.length === 0) {
+      console.log(`  (no can_label=true repos in config)`);
+    }
+    for (const repo of targets) {
+      if (opts.dryRun) {
+        console.log(`  → [dry-run] would ensure 11 standard labels on ${repo.slug}`);
+        continue;
+      }
+      try {
+        const r = ensureStandardLabels(repo.slug);
+        const parts = [
+          `${r.created.length} created`,
+          `${r.existing.length} already present`,
+        ];
+        if (r.failed.length > 0) parts.push(`${r.failed.length} failed`);
+        console.log(`  → ${repo.slug.padEnd(40)} ${parts.join(", ")}`);
+        if (r.created.length > 0) {
+          console.log(`      created: ${r.created.join(", ")}`);
+        }
+        for (const f of r.failed) {
+          console.log(`      ! ${f.name}: ${f.error}`);
+        }
+      } catch (e) {
+        console.error(`  ! ${repo.slug.padEnd(40)} ${(e as Error).message}`);
+      }
+    }
+  }
+
+  // 5. PATH check on shim
   const shimTarget = join(d.dispatchRepo, "bin/dispatch");
   console.log("");
   console.log("Next:");
