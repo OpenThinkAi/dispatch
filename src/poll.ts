@@ -5,7 +5,7 @@ import { claimIssue, listIssuesSince } from "./github.ts";
 import { log } from "./log.ts";
 import { State, hashIssueContent } from "./state.ts";
 import { triageIssue } from "./triage.ts";
-import { applyLabels } from "./sinks/labels.ts";
+import { applyLabels, clearLabels } from "./sinks/labels.ts";
 import { holdForSecurityReview } from "./sinks/security.ts";
 import { buildProjectIndex, pullIntoVault, type ProjectIndex } from "./sinks/vault.ts";
 import { curateTicket } from "./curator.ts";
@@ -507,7 +507,14 @@ function latestWorktreeMtime(ticketId: string, maxDepth = 4): number | null {
     for (const e of entries) {
       const full = join(dir, e.name);
       if (e.isDirectory()) {
-        if (e.name === ".git") continue;
+        // Skip .git (huge object store, only ever changes via git plumbing
+        // we'd see via top-level repo activity anyway) and standard build
+        // output dirs (cargo target, node_modules, etc. can each hold tens
+        // of thousands of stats per call without the agent making meaningful
+        // progress through them).
+        if (e.name === ".git" || e.name === "node_modules" || e.name === "target"
+          || e.name === "dist" || e.name === "build" || e.name === ".next"
+          || e.name === ".turbo" || e.name === "vendor") continue;
         if (depth < maxDepth) walk(full, depth + 1);
       } else if (e.isFile()) {
         try {
@@ -570,6 +577,7 @@ function driveInFlight(cfg: Config, state: State, summary: PollSummary): void {
         number: row.number,
         vault_ticket_id: row.vault_ticket_id,
       });
+      clearLabels(repo, row.number, ["agent:assigned"]);
       state.setTriageStatus(row.slug, row.number, "pipeline-held");
       summary.errors += 1;
       continue;
@@ -592,6 +600,11 @@ function driveInFlight(cfg: Config, state: State, summary: PollSummary): void {
         ticket: row.vault_ticket_id,
         final_state: currentState,
       });
+      // oteam's QA-close path already strips agent:assigned on the happy
+      // path; this clearLabels call is defense-in-depth for terminal
+      // transitions that didn't go through QA close (e.g. issue closed
+      // externally before QA, ticket moved straight to archive).
+      clearLabels(repo, row.number, ["agent:assigned"]);
       state.setTriageStatus(row.slug, row.number, "pipeline-complete");
       continue;
     }
@@ -602,6 +615,7 @@ function driveInFlight(cfg: Config, state: State, summary: PollSummary): void {
         number: row.number,
         ticket: row.vault_ticket_id,
       });
+      clearLabels(repo, row.number, ["agent:assigned"]);
       state.setTriageStatus(row.slug, row.number, "pipeline-held");
       continue;
     }
@@ -633,6 +647,7 @@ function driveInFlight(cfg: Config, state: State, summary: PollSummary): void {
           minutes_since_activity: Math.round(sinceActivity / 60000),
           threshold_minutes: Math.round(STUCK_THRESHOLD_MS / 60000),
         });
+        clearLabels(repo, row.number, ["agent:assigned"]);
         state.setTriageStatus(row.slug, row.number, "pipeline-held");
       }
       continue;
