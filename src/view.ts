@@ -1,8 +1,9 @@
 import { mount } from "@openthink/ui-leaf";
 import { existsSync, openSync, readSync, closeSync, statSync, watch } from "node:fs";
-import { homedir } from "node:os";
-import { dirname, resolve } from "node:path";
+import { homedir, platform } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { loadConfig } from "./config.ts";
 
 const RELEVANT_DISPATCH_MSGS = new Set<string>([
   "issue filed to vault",
@@ -310,11 +311,37 @@ function tailFile(path: string, ingest: (raw: string) => void) {
   }
 }
 
+/** Pick a sensible default log dir for the current platform. macOS keeps the
+ * launchd-friendly `~/Library/Logs/dispatch`; everywhere else follows the XDG
+ * state convention. The actual daemon log_dir is configurable via
+ * dispatch.toml, so we prefer that when we can read the config. */
+function defaultLogDir(): string {
+  if (platform() === "darwin") {
+    return join(homedir(), "Library", "Logs", "dispatch");
+  }
+  const xdg = process.env.XDG_STATE_HOME;
+  return xdg ? join(xdg, "dispatch") : join(homedir(), ".local", "state", "dispatch");
+}
+
+function resolveDispatchLogDir(): string {
+  try {
+    const cfg = loadConfig();
+    if (cfg.defaults.log_dir) return resolve(cfg.defaults.log_dir);
+  } catch {
+    // Config missing or invalid — fall through to the per-platform default.
+    // `dispatch view` should still mount; an empty stream is a better failure
+    // mode than refusing to start.
+  }
+  return defaultLogDir();
+}
+
 export async function runView(): Promise<number> {
   const here = dirname(fileURLToPath(import.meta.url));
-  const viewsRoot = resolve(here, "..", "views");
+  const viewsRoot = process.env.DISPATCH_VIEWS_ROOT
+    ? resolve(process.env.DISPATCH_VIEWS_ROOT)
+    : resolve(here, "..", "views");
 
-  const dispatchLogDir = resolve(homedir(), "Library", "Logs", "dispatch");
+  const dispatchLogDir = resolveDispatchLogDir();
   const stdoutPath = resolve(dispatchLogDir, "stdout.log");
   const stderrPath = resolve(dispatchLogDir, "stderr.log");
   const telemetryPath = resolve(homedir(), ".open-team", "telemetry", "runs.jsonl");

@@ -76,7 +76,15 @@ export async function pollOnce(cfg: Config): Promise<PollSummary> {
       }
     }
 
-    // ── Phase B+C: curate, then orchestrate ──────────────────────────────
+    // ── Phase B: sweep previously-deferred green-lit rows ───────────────
+    // Rows landed in "green-lit" because a prior tick hit the spawn cap, the
+    // claim API failed transiently, or the oteam assign spawn failed. Without
+    // a sweeper they were stranded — neither curate nor drive queried that
+    // status. Sweep runs before curate so older deferred work doesn't starve
+    // against fresh ingestion.
+    sweepGreenLit(cfg, state, summary);
+
+    // ── Phase C: curate new awaiting-curation rows, fire on green decision ──
     await curateAndOrchestrate(cfg, state, summary);
 
     // ── Phase D: drive in-flight tickets through the role pipeline ───────
@@ -96,7 +104,10 @@ async function curateAndOrchestrate(cfg: Config, state: State, summary: PollSumm
     return;
   }
 
-  let spawnsThisTick = 0;
+  // Share the per-tick spawn budget with the sweep that ran before us so
+  // fresh curation can't blow past the cap that the sweeper already started
+  // consuming.
+  let spawnsThisTick = summary.fired;
   const maxSpawns = cfg.defaults.max_orchestrator_spawns_per_tick;
 
   for (const row of awaiting) {
@@ -282,6 +293,106 @@ async function curateAndOrchestrate(cfg: Config, state: State, summary: PollSumm
   }
 }
 
+/**
+ * Re-attempt the fire path for rows the curator already decided to fire on but
+ * which got deferred to "green-lit" by a prior tick — spawn cap reached,
+ * claim failed transiently, or oteam assign failed. Without this sweep these
+ * rows would sit forever: curateAndOrchestrate only queries "awaiting-curation"
+ * and driveInFlight only queries "driving".
+ *
+ * Skipped: repos with autopilot "off" (orphan rows; operator decides) or
+ * "curate-only" (those are intentionally green-lit for human review).
+ */
+function sweepGreenLit(cfg: Config, state: State, summary: PollSummary): void {
+  const greenLit = state.listByStatus("green-lit", 100);
+  if (greenLit.length === 0) return;
+
+  const maxSpawns = cfg.defaults.max_orchestrator_spawns_per_tick;
+
+  for (const row of greenLit) {
+    if (summary.fired >= maxSpawns) {
+      log.debug("sweep: spawn cap reached; deferring remaining green-lit", {
+        cap: maxSpawns,
+      });
+      return;
+    }
+
+    const repo = cfg.repos.find(r => r.slug.toLowerCase() === row.slug.toLowerCase());
+    if (!repo) continue;
+    if (repo.autopilot === "off" || repo.autopilot === "curate-only") continue;
+
+    const ticketPath = vaultTicketPath(state, repo.vault, row);
+    if (!ticketPath) {
+      log.error("sweep: vault ticket file gone; marking failed", {
+        slug: row.slug,
+        number: row.number,
+        vault_ticket_id: row.vault_ticket_id,
+      });
+      state.setTriageStatus(row.slug, row.number, "failed");
+      summary.errors += 1;
+      continue;
+    }
+
+    const claim = claimIssue(row.slug, row.number, cfg.defaults.bot_identity);
+    if (!claim.ok) {
+      if (claim.reason === "already-claimed") {
+        log.info("sweep: issue claimed by other actor; marking lost-race", {
+          slug: row.slug,
+          number: row.number,
+          assignees: claim.assignees,
+        });
+        state.setTriageStatus(row.slug, row.number, "lost-race");
+        continue;
+      }
+      if (claim.reason === "issue-closed") {
+        log.info("sweep: issue closed before claim; marking gh-resolved", {
+          slug: row.slug,
+          number: row.number,
+        });
+        state.setTriageStatus(row.slug, row.number, "gh-resolved");
+        summary.gh_resolved += 1;
+        continue;
+      }
+      log.warn("sweep: claim failed; leaving green-lit for next tick", {
+        slug: row.slug,
+        number: row.number,
+        reason: claim.reason,
+        error: claim.reason === "api-error" ? claim.error : undefined,
+      });
+      summary.errors += 1;
+      continue;
+    }
+
+    const spawn = spawnOteamAssign(ticketPath, cfg.defaults.log_dir);
+    if (!spawn.ok) {
+      log.error("sweep: oteam assign spawn failed; leaving green-lit", {
+        slug: row.slug,
+        number: row.number,
+        error: spawn.error,
+      });
+      summary.errors += 1;
+      continue;
+    }
+
+    log.info("sweep: fired previously-deferred green-lit row", {
+      slug: row.slug,
+      number: row.number,
+      ticket: row.vault_ticket_id,
+      autopilot: repo.autopilot,
+      pid: spawn.pid,
+    });
+
+    if (repo.autopilot === "drive") {
+      const initial = readVaultTicketState(ticketPath) ?? "triage";
+      state.setTriageStatus(row.slug, row.number, "driving");
+      state.setLastFiredForState(row.slug, row.number, initial);
+    } else {
+      state.setTriageStatus(row.slug, row.number, "fired");
+    }
+    summary.fired += 1;
+  }
+}
+
 function vaultTicketPath(_state: State, vault: string, row: { vault_ticket_id: string | null }): string | null {
   if (!row.vault_ticket_id) return null;
   const vaultPath = resolveVaultPath(vault);
@@ -299,17 +410,24 @@ function vaultTicketPath(_state: State, vault: string, row: { vault_ticket_id: s
     }
   }
   // Also search archive subdirs (organized as archive/<YYYY-MM>/<ID>-*.md).
-  const archiveRoot = join(vaultPath, "tickets", "archive");
-  let monthDirs: string[];
-  try { monthDirs = readdirSync(archiveRoot); } catch { return null; }
-  for (const month of monthDirs) {
-    const dir = join(archiveRoot, month);
-    let entries: string[];
-    try { entries = readdirSync(dir); } catch { continue; }
-    const match = entries.find(n => n.startsWith(`${row.vault_ticket_id}-`) && n.endsWith(".md"));
-    if (match) {
-      const candidate = join(dir, match);
-      if (existsSync(candidate)) return candidate;
+  // oteam writes archives to <vault>/archive/. The <vault>/tickets/archive/
+  // fallback covers older vault layouts that nested archive under tickets.
+  const archiveRoots = [
+    join(vaultPath, "archive"),
+    join(vaultPath, "tickets", "archive"),
+  ];
+  for (const archiveRoot of archiveRoots) {
+    let monthDirs: string[];
+    try { monthDirs = readdirSync(archiveRoot); } catch { continue; }
+    for (const month of monthDirs) {
+      const dir = join(archiveRoot, month);
+      let entries: string[];
+      try { entries = readdirSync(dir); } catch { continue; }
+      const match = entries.find(n => n.startsWith(`${row.vault_ticket_id}-`) && n.endsWith(".md"));
+      if (match) {
+        const candidate = join(dir, match);
+        if (existsSync(candidate)) return candidate;
+      }
     }
   }
   return null;
@@ -385,7 +503,7 @@ function driveInFlight(cfg: Config, state: State, summary: PollSummary): void {
       continue;
     }
 
-    if (isTerminalVaultState(currentState) || ticketPath.includes("/tickets/archive/")) {
+    if (isTerminalVaultState(currentState) || ticketPath.includes("/archive/")) {
       log.info("driving row: pipeline complete", {
         slug: row.slug,
         number: row.number,
