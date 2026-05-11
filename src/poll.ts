@@ -1,4 +1,5 @@
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { claimIssue, listIssuesSince } from "./github.ts";
 import { log } from "./log.ts";
@@ -265,6 +266,11 @@ async function curateAndOrchestrate(cfg: Config, state: State, summary: PollSumm
         summary.errors += 1;
         continue;
       }
+      // Claim succeeded and we've spawned the agent — mark the GH issue
+      // visually so operators scanning the board can distinguish
+      // "currently being worked by an agent" from any other open issue.
+      // applyLabels is best-effort (respects can_label, swallows errors).
+      applyLabels(repo, row.number, ["agent:assigned"]);
       appendVaultComment(
         ticketPath,
         "Curator",
@@ -374,6 +380,8 @@ function sweepGreenLit(cfg: Config, state: State, summary: PollSummary): void {
       continue;
     }
 
+    applyLabels(repo, row.number, ["agent:assigned"]);
+
     log.info("sweep: fired previously-deferred green-lit row", {
       slug: row.slug,
       number: row.number,
@@ -455,6 +463,80 @@ function isTerminalVaultState(state: string): boolean {
 
 const STUCK_THRESHOLD_MS = 60 * 60 * 1000; // 60 min
 
+/** Scan ~/.open-team/telemetry/runs.jsonl for the most recent line referencing
+ * `ticketId`, return its latest timestamp (started-at or ended-at) in ms.
+ * Returns null if no entries match or the file is unavailable.
+ *
+ * Telemetry rows are appended on phase completion, so this only catches
+ * multi-phase progression — within-phase activity is covered by the worktree
+ * heartbeat below. */
+function latestTelemetryActivity(ticketId: string): number | null {
+  if (!ticketId) return null;
+  const path = join(homedir(), ".open-team", "telemetry", "runs.jsonl");
+  let text: string;
+  try { text = readFileSync(path, "utf-8"); } catch { return null; }
+  const needle = `"ticket":"${ticketId}"`;
+  let maxMs = 0;
+  for (const line of text.split("\n")) {
+    if (!line.includes(needle)) continue;
+    let row: { "started-at"?: unknown; "ended-at"?: unknown };
+    try { row = JSON.parse(line); } catch { continue; }
+    for (const key of ["started-at", "ended-at"] as const) {
+      const v = row[key];
+      if (typeof v !== "string") continue;
+      const ms = Date.parse(v);
+      if (!Number.isNaN(ms) && ms > maxMs) maxMs = ms;
+    }
+  }
+  return maxMs > 0 ? maxMs : null;
+}
+
+/** Recursive max mtime across the per-ticket oteam worktree (skipping `.git`
+ * and bounding depth so a deeply nested dep tree doesn't blow the stuck check
+ * budget). Catches within-phase file activity — agent edits, build artifacts,
+ * test runs — that no other signal sees. Returns null when the worktree is
+ * absent (e.g. orphan row, agent never spawned, or workspace already GC'd). */
+function latestWorktreeMtime(ticketId: string, maxDepth = 4): number | null {
+  if (!ticketId) return null;
+  const root = join("/tmp", "open-team-issues", ticketId.toLowerCase(), "repo");
+  if (!existsSync(root)) return null;
+  let maxMs = 0;
+  const walk = (dir: string, depth: number): void => {
+    let entries: import("node:fs").Dirent[];
+    try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const full = join(dir, e.name);
+      if (e.isDirectory()) {
+        if (e.name === ".git") continue;
+        if (depth < maxDepth) walk(full, depth + 1);
+      } else if (e.isFile()) {
+        try {
+          const ms = statSync(full).mtimeMs;
+          if (ms > maxMs) maxMs = ms;
+        } catch { /* ignore unreadable file */ }
+      }
+    }
+  };
+  walk(root, 0);
+  return maxMs > 0 ? maxMs : null;
+}
+
+/** Most recent activity timestamp across every signal we have. Used by the
+ * stuck-detection check to avoid false-flagging long-but-active phases. */
+function latestActivityMs(row: {
+  last_processed_at: string;
+  vault_ticket_id: string | null;
+}): { ms: number; source: "row" | "telemetry" | "worktree" } {
+  const rowMs = new Date(row.last_processed_at).getTime();
+  let best: { ms: number; source: "row" | "telemetry" | "worktree" } = { ms: rowMs, source: "row" };
+  if (!row.vault_ticket_id) return best;
+  const tele = latestTelemetryActivity(row.vault_ticket_id);
+  if (tele !== null && tele > best.ms) best = { ms: tele, source: "telemetry" };
+  const wt = latestWorktreeMtime(row.vault_ticket_id);
+  if (wt !== null && wt > best.ms) best = { ms: wt, source: "worktree" };
+  return best;
+}
+
 function driveInFlight(cfg: Config, state: State, summary: PollSummary): void {
   const inFlight = state.listByStatus("driving", 100);
   if (inFlight.length === 0) return;
@@ -533,14 +615,22 @@ function driveInFlight(cfg: Config, state: State, summary: PollSummary): void {
       // to pipeline-held so the row leaves the active set and shows up
       // in operator dashboards as needing attention. Self-quarantines
       // rather than silently piling up.
-      const sinceFire = Date.now() - new Date(row.last_processed_at).getTime();
-      if (sinceFire > STUCK_THRESHOLD_MS) {
+      //
+      // last_processed_at is wall-clock-only: a long-but-active impl phase
+      // (cargo build retries, large test suite) looks identical to a
+      // genuinely hung phase. Augment with telemetry (per-phase completion
+      // records — catches multi-phase progression) and worktree mtime
+      // (within-phase file activity — catches the slow-impl case).
+      const activity = latestActivityMs(row);
+      const sinceActivity = Date.now() - activity.ms;
+      if (sinceActivity > STUCK_THRESHOLD_MS) {
         log.warn("driving row: stuck past threshold; marking pipeline-held", {
           slug: row.slug,
           number: row.number,
           ticket: row.vault_ticket_id,
           state: currentState,
-          minutes_since_fire: Math.round(sinceFire / 60000),
+          activity_source: activity.source,
+          minutes_since_activity: Math.round(sinceActivity / 60000),
           threshold_minutes: Math.round(STUCK_THRESHOLD_MS / 60000),
         });
         state.setTriageStatus(row.slug, row.number, "pipeline-held");

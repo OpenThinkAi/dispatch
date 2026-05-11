@@ -16,6 +16,7 @@ export const STANDARD_LABELS: StandardLabel[] = [
   { name: "p1",          color: "d93f0b", description: "Priority: high" },
   { name: "p2",          color: "fbca04", description: "Priority: medium" },
   { name: "p3",          color: "c5def5", description: "Priority: low" },
+  { name: "agent:assigned", color: "fbca04", description: "Agent is currently working this issue" },
 ];
 
 export const STANDARD_LABEL_NAMES: string[] = STANDARD_LABELS.map(l => l.name);
