@@ -77,6 +77,14 @@ export function addLabels(slug: string, number: number, labels: string[]): void 
   if (!r.ok) throw new Error(`gh add-labels failed for ${slug}#${number}: ${r.stderr}`);
 }
 
+export function removeLabels(slug: string, number: number, labels: string[]): void {
+  if (labels.length === 0) return;
+  const args = ["issue", "edit", String(number), "--repo", slug];
+  for (const l of labels) args.push("--remove-label", l);
+  const r = gh(args);
+  if (!r.ok) throw new Error(`gh remove-labels failed for ${slug}#${number}: ${r.stderr}`);
+}
+
 /** List repo-level label definitions (not labels on a particular issue). */
 export function listLabels(slug: string): { name: string }[] {
   const r = gh([

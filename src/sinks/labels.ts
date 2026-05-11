@@ -1,4 +1,4 @@
-import { addLabels as ghAddLabels, createLabel, listLabels } from "../github.ts";
+import { addLabels as ghAddLabels, createLabel, listLabels, removeLabels as ghRemoveLabels } from "../github.ts";
 import { STANDARD_LABELS } from "../labels-standard.ts";
 import { log } from "../log.ts";
 import type { RepoConfig } from "../types.ts";
@@ -15,6 +15,27 @@ export function applyLabels(repo: RepoConfig, number: number, labels: string[]):
   } catch (e) {
     // never fatal — vault filing already succeeded
     log.warn("labels apply failed", {
+      slug: repo.slug,
+      number,
+      labels,
+      error: (e as Error).message,
+    });
+  }
+}
+
+export function clearLabels(repo: RepoConfig, number: number, labels: string[]): void {
+  if (labels.length === 0) return;
+  if (!repo.can_label) {
+    log.debug("skipping label clear (can_label=false)", { slug: repo.slug, number, labels });
+    return;
+  }
+  try {
+    ghRemoveLabels(repo.slug, number, labels);
+    log.info("labels cleared", { slug: repo.slug, number, labels });
+  } catch (e) {
+    // best-effort: a missing label or a closed issue both produce non-zero
+    // exits from `gh issue edit --remove-label`; neither should fail the tick.
+    log.warn("labels clear failed", {
       slug: repo.slug,
       number,
       labels,
