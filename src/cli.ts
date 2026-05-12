@@ -25,7 +25,11 @@ Commands:
   config validate            Parse config + cross-check vault projects; exit non-zero on failure
   config path                Print resolved config path
   state show                 Print cursors, recent processed issues, recent curator decisions
-  view                       Open a browser-based live event feed of dispatch + oteam telemetry
+  view [--views-root=PATH] [--shell=tab|app]
+                             Open a browser-based live event feed of dispatch + oteam telemetry.
+                             --views-root points at a custom views directory containing your own
+                             log-stream.tsx (see README "Custom views"). --shell=app opens a
+                             chromeless Chrome --app window instead of a regular tab.
   update                     Self-update to the latest @openthink/dispatch on npm; restart the daemon
   setup [--force] [--interval SEC] [--dry-run] [--create-labels]
                              Detect machine, write the launchd plist, and seed config.
@@ -37,7 +41,8 @@ Environment:
   DISPATCH_CONFIG            Override config path (default ~/.config/dispatch/dispatch.toml)
   ANTHROPIC_API_KEY          Used by triage + curator if Claude Code isn't logged in
   DISPATCH_DEBUG=1           Verbose logging
-  DISPATCH_VIEW_SHELL=app    Open \`dispatch view\` in a chromeless Chrome --app window (default: tab)
+  DISPATCH_VIEWS_ROOT        Custom views directory for \`dispatch view\` (fallback for --views-root)
+  DISPATCH_VIEW_SHELL=app    Open \`dispatch view\` in a chromeless Chrome --app window (fallback for --shell)
 `;
 
 async function main(argv: string[]): Promise<number> {
@@ -177,7 +182,30 @@ async function main(argv: string[]): Promise<number> {
     }
 
     case "view": {
-      return runView();
+      const args = sub ? [sub, ...rest] : rest;
+      let viewsRoot: string | undefined;
+      let shell: "tab" | "app" | undefined;
+      for (const a of args) {
+        if (a.startsWith("--views-root=")) {
+          viewsRoot = a.slice("--views-root=".length);
+          continue;
+        }
+        if (a.startsWith("--shell=")) {
+          const v = a.slice("--shell=".length);
+          if (v !== "tab" && v !== "app") {
+            console.error(`invalid --shell value: ${v} (expected "tab" or "app")`);
+            return 2;
+          }
+          shell = v;
+          continue;
+        }
+        console.error(
+          `unknown argument for \`dispatch view\`: ${a}\n` +
+            `expected --views-root=PATH and/or --shell=tab|app (use \`=\`, not space)`,
+        );
+        return 2;
+      }
+      return runView({ viewsRoot, shell });
     }
 
     case "update": {

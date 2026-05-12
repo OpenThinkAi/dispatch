@@ -211,6 +211,61 @@ side effects. For full vault-write verification, run
 | Pause | `launchctl bootout gui/$(id -u)/com.${USER}.dispatch` |
 | Re-enable | `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.${USER}.dispatch.plist` |
 
+## Custom views
+
+`dispatch view` mounts a bundled React view (`views/log-stream.tsx`) via
+[`@openthink/ui-leaf`](https://www.npmjs.com/package/@openthink/ui-leaf).
+You can swap in your own view by pointing the command at a different
+directory:
+
+```sh
+dispatch view --views-root=/path/to/your/views
+dispatch view --shell=app                       # chromeless Chrome window instead of a tab
+```
+
+`DISPATCH_VIEWS_ROOT` and `DISPATCH_VIEW_SHELL=app` are silent fallbacks
+for the same two settings, but the flags are preferred — they show up in
+`dispatch view --help` and don't pollute the environment for other
+processes.
+
+The directory must contain a file named **`log-stream.tsx`** — the view
+name is hardcoded to `log-stream` in dispatch's mount call. The file
+must export a default React component whose props match `ViewProps<LogStreamData>`,
+where `LogStreamData` is the shape dispatch pushes on every update:
+
+```ts
+interface LogEntry {
+  startTs: string;       // ISO; earliest ts in a collapsed group
+  endTs: string;         // ISO; most recent ts in a collapsed group
+  level: "info" | "warn" | "error";
+  source: "dispatch" | "telemetry";
+  msg: string;           // e.g. "issue filed to vault", "phase ?", "poll complete · ingested 2"
+  count: number;         // collapsed-group multiplier (1 if not collapsed)
+  ticket?: string;       // AGT-NNN when applicable
+  slug?: string;         // owner/repo when applicable
+  number?: number;       // GH issue number when applicable
+  phase?: string;        // role-pipeline phase (telemetry rows only)
+  ms?: number;           // wall-clock duration of the phase (telemetry rows only)
+  distinctSlugs: number; // distinct repos seen in a collapsed group
+}
+
+interface LogStreamData {
+  entries: LogEntry[];
+  startedAt: string;             // ISO; when the view process booted
+  latestPoll: {                  // last "poll complete" summary, or null
+    ts: string;
+    ingested: number;
+    fired: number;
+    errors: number;
+  } | null;
+}
+```
+
+The canonical reference is `views/log-stream.tsx` in this repo — copy
+it and edit. Filtering, column toggles, and any other per-user state
+are the responsibility of the view itself; dispatch's data layer is
+read-only and stateless, and ui-leaf has no built-in preferences store.
+
 ## State
 
 ```
