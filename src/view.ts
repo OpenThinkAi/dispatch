@@ -359,6 +359,11 @@ export async function runView(): Promise<number> {
     // session if the tab is closed without a clean shutdown, which is
     // fine for an operator dashboard.
     heartbeatTimeoutMs: 300_000,
+    // Opt-in chromeless window: DISPATCH_VIEW_SHELL=app makes ui-leaf
+    // launch a Chrome --app window (isolated user-data-dir, post
+    // ui-leaf#55) instead of a regular tab. Default stays "tab" so
+    // existing operators see no behavior change.
+    shell: process.env.DISPATCH_VIEW_SHELL === "app" ? "app" : "tab",
   });
 
   console.error(`[dispatch view] ready at ${viewHandle.url}`);

@@ -37,6 +37,7 @@ Environment:
   DISPATCH_CONFIG            Override config path (default ~/.config/dispatch/dispatch.toml)
   ANTHROPIC_API_KEY          Used by triage + curator if Claude Code isn't logged in
   DISPATCH_DEBUG=1           Verbose logging
+  DISPATCH_VIEW_SHELL=app    Open \`dispatch view\` in a chromeless Chrome --app window (default: tab)
 `;
 
 async function main(argv: string[]): Promise<number> {
