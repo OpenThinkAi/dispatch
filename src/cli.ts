@@ -182,18 +182,30 @@ async function main(argv: string[]): Promise<number> {
     }
 
     case "view": {
-      const args = [sub, ...rest].filter((a): a is string => typeof a === "string");
-      const viewsRootArg = args.find(a => a.startsWith("--views-root="));
-      const shellArg = args.find(a => a.startsWith("--shell="));
-      const viewsRoot = viewsRootArg ? viewsRootArg.split("=")[1] : undefined;
+      const args = (sub ? [sub, ...rest] : rest).filter(
+        (a): a is string => typeof a === "string",
+      );
+      let viewsRoot: string | undefined;
       let shell: "tab" | "app" | undefined;
-      if (shellArg) {
-        const v = shellArg.split("=")[1];
-        if (v !== "tab" && v !== "app") {
-          console.error(`invalid --shell value: ${v} (expected "tab" or "app")`);
-          return 2;
+      for (const a of args) {
+        if (a.startsWith("--views-root=")) {
+          viewsRoot = a.slice("--views-root=".length);
+          continue;
         }
-        shell = v;
+        if (a.startsWith("--shell=")) {
+          const v = a.slice("--shell=".length);
+          if (v !== "tab" && v !== "app") {
+            console.error(`invalid --shell value: ${v} (expected "tab" or "app")`);
+            return 2;
+          }
+          shell = v;
+          continue;
+        }
+        console.error(
+          `unknown argument for \`dispatch view\`: ${a}\n` +
+            `expected --views-root=PATH and/or --shell=tab|app (use \`=\`, not space)`,
+        );
+        return 2;
       }
       return runView({ viewsRoot, shell });
     }
