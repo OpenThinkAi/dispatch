@@ -139,7 +139,7 @@ async function checkTriageSdk(cfg: Config | null): Promise<StageResult> {
   if (!repo) return { skip: true, detail: "skipped (no repos in config)" };
   const issue = syntheticIssue(repo.slug);
   try {
-    const r = await triageIssue({
+    const { result: r, cost_usd } = await triageIssue({
       issue,
       repo,
       model: cfg.defaults.triage_model,
@@ -151,10 +151,10 @@ async function checkTriageSdk(cfg: Config | null): Promise<StageResult> {
     if (!Array.isArray(r.labels_to_add)) {
       return { ok: false, detail: `${cfg.defaults.triage_model}: labels_to_add not an array` };
     }
-    return {
-      ok: true,
-      detail: `${cfg.defaults.triage_model}: summary="${r.summary.slice(0, 60)}..."; labels=${JSON.stringify(r.labels_to_add)}`,
-    };
+    const detail = `${cfg.defaults.triage_model}: summary="${r.summary.slice(0, 60)}..."; labels=${JSON.stringify(r.labels_to_add)}`;
+    return cost_usd !== null
+      ? { ok: true, detail, cost_usd }
+      : { ok: true, detail };
   } catch (e) {
     return { ok: false, detail: `${cfg.defaults.triage_model}: ${(e as Error).message.split("\n")[0]}` };
   }

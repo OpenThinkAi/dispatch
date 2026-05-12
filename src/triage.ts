@@ -19,12 +19,19 @@ Rules:
 - Do not invent priority labels (p0/p1) for things that aren't time-critical.
 - Output JSON only, no prose, no code fences.`;
 
+export type TriageOutcome = {
+  result: TriageResult;
+  /** total_cost_usd reported by the SDK result message; null when the SDK
+   * didn't surface a numeric cost (e.g. cached/free-tier responses). */
+  cost_usd: number | null;
+};
+
 export async function triageIssue(args: {
   issue: GitHubIssue;
   repo: RepoConfig;
   model: string;
   bodyTruncate: number;
-}): Promise<TriageResult> {
+}): Promise<TriageOutcome> {
   const { issue, repo, model, bodyTruncate } = args;
 
   const truncatedBody = (issue.body ?? "").slice(0, bodyTruncate);
@@ -46,7 +53,7 @@ export async function triageIssue(args: {
     "Respond with ONLY the JSON object — no prose, no code fences.",
   ].filter(Boolean).join("\n");
 
-  const result = query({
+  const sdk = query({
     prompt: userPrompt,
     options: {
       systemPrompt: SYSTEM_PROMPT,
@@ -58,10 +65,12 @@ export async function triageIssue(args: {
   });
 
   let finalText: string | null = null;
-  for await (const msg of result) {
+  let cost: number | null = null;
+  for await (const msg of sdk) {
     if (msg.type === "result") {
       if (msg.subtype === "success") {
         finalText = msg.result;
+        cost = typeof msg.total_cost_usd === "number" ? msg.total_cost_usd : null;
         break;
       }
       throw new Error(`triage SDK returned error result: ${msg.subtype}`);
@@ -72,7 +81,7 @@ export async function triageIssue(args: {
     throw new Error("triage SDK ended without a result message");
   }
 
-  return parseTriageJSON(finalText);
+  return { result: parseTriageJSON(finalText), cost_usd: cost };
 }
 
 function parseTriageJSON(text: string): TriageResult {

@@ -16,6 +16,16 @@ export type SeenRow = {
    * `oteam assign` for this row. NULL until the first fire. Used by the
    * drive loop to detect phase advances (current state != last_fired_for_state). */
   last_fired_for_state: string | null;
+  /** PID of the most recent `oteam assign` spawn dispatch issued for this
+   * row. NULL until the first spawn. The drive loop checks this with
+   * `kill -0` before firing the next phase: if the prior process is still
+   * alive (e.g. spike auto-proceeded into in-progress mid-process), dispatch
+   * must NOT spawn a second concurrent agent. */
+  spawned_pid: number | null;
+  /** ISO timestamp of when `spawned_pid` was recorded. Used by future
+   * follow-ups to bound trust in the PID against process-id reuse on long-
+   * running daemons; not consulted by the current liveness check. */
+  spawned_at: string | null;
 };
 
 export type CuratorDecisionRow = {
@@ -77,6 +87,15 @@ export class State {
     const hasLastFiredForState = seenCols.some(c => c.name === "last_fired_for_state");
     if (!hasLastFiredForState) {
       this.db.exec(`ALTER TABLE seen ADD COLUMN last_fired_for_state TEXT;`);
+    }
+    // Migrate: add spawned_pid + spawned_at for drive-loop PID liveness check.
+    const hasSpawnedPid = seenCols.some(c => c.name === "spawned_pid");
+    if (!hasSpawnedPid) {
+      this.db.exec(`ALTER TABLE seen ADD COLUMN spawned_pid INTEGER;`);
+    }
+    const hasSpawnedAt = seenCols.some(c => c.name === "spawned_at");
+    if (!hasSpawnedAt) {
+      this.db.exec(`ALTER TABLE seen ADD COLUMN spawned_at TEXT;`);
     }
 
     this.cursorsPath = join(stateDir, "cursors.json");
@@ -151,6 +170,26 @@ export class State {
     this.db.run(
       `UPDATE seen SET last_fired_for_state = ?, last_processed_at = ? WHERE slug = ? AND number = ?`,
       [vaultState, now, slug, number]
+    );
+  }
+
+  /** Persist the PID of the most recent `oteam assign` spawn so the drive
+   * loop can check liveness before firing the next phase (prevents the
+   * double-fire that happens when spike auto-proceeds mid-process). */
+  setSpawn(slug: string, number: number, pid: number): void {
+    const now = new Date().toISOString();
+    this.db.run(
+      `UPDATE seen SET spawned_pid = ?, spawned_at = ? WHERE slug = ? AND number = ?`,
+      [pid, now, slug, number]
+    );
+  }
+
+  /** Clear the spawn record. Called on terminal transitions so a stale PID
+   * doesn't sit on a row whose phase pipeline already ended. */
+  clearSpawn(slug: string, number: number): void {
+    this.db.run(
+      `UPDATE seen SET spawned_pid = NULL, spawned_at = NULL WHERE slug = ? AND number = ?`,
+      [slug, number]
     );
   }
 
