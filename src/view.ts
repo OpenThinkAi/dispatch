@@ -335,11 +335,23 @@ function resolveDispatchLogDir(): string {
   return defaultLogDir();
 }
 
-export async function runView(): Promise<number> {
+export interface RunViewOptions {
+  viewsRoot?: string;
+  shell?: "tab" | "app";
+}
+
+export async function runView(opts: RunViewOptions = {}): Promise<number> {
   const here = dirname(fileURLToPath(import.meta.url));
-  const viewsRoot = process.env.DISPATCH_VIEWS_ROOT
-    ? resolve(process.env.DISPATCH_VIEWS_ROOT)
-    : resolve(here, "..", "views");
+  // Precedence: explicit option > DISPATCH_VIEWS_ROOT env var > bundled views.
+  // The env var stays as a silent fallback so existing setups keep working
+  // unchanged; new callers should prefer the flag.
+  const viewsRoot = opts.viewsRoot
+    ? resolve(opts.viewsRoot)
+    : process.env.DISPATCH_VIEWS_ROOT
+      ? resolve(process.env.DISPATCH_VIEWS_ROOT)
+      : resolve(here, "..", "views");
+  const shell: "tab" | "app" =
+    opts.shell ?? (process.env.DISPATCH_VIEW_SHELL === "app" ? "app" : "tab");
 
   const dispatchLogDir = resolveDispatchLogDir();
   const stdoutPath = resolve(dispatchLogDir, "stdout.log");
@@ -359,11 +371,11 @@ export async function runView(): Promise<number> {
     // session if the tab is closed without a clean shutdown, which is
     // fine for an operator dashboard.
     heartbeatTimeoutMs: 300_000,
-    // Opt-in chromeless window: DISPATCH_VIEW_SHELL=app makes ui-leaf
-    // launch a Chrome --app window (isolated user-data-dir, post
+    // Opt-in chromeless window via --shell=app or DISPATCH_VIEW_SHELL=app:
+    // launches a Chrome --app window (isolated user-data-dir, post
     // ui-leaf#55) instead of a regular tab. Default stays "tab" so
     // existing operators see no behavior change.
-    shell: process.env.DISPATCH_VIEW_SHELL === "app" ? "app" : "tab",
+    shell,
   });
 
   console.error(`[dispatch view] ready at ${viewHandle.url}`);
