@@ -182,9 +182,7 @@ async function main(argv: string[]): Promise<number> {
     }
 
     case "view": {
-      const args = (sub ? [sub, ...rest] : rest).filter(
-        (a): a is string => typeof a === "string",
-      );
+      const args = sub ? [sub, ...rest] : rest;
       let viewsRoot: string | undefined;
       let shell: "tab" | "app" | undefined;
       for (const a of args) {
