@@ -271,6 +271,10 @@ async function curateAndOrchestrate(cfg: Config, state: State, summary: PollSumm
       // "currently being worked by an agent" from any other open issue.
       // applyLabels is best-effort (respects can_label, swallows errors).
       applyLabels(repo, row.number, ["agent:assigned"]);
+      // Persist PID so driveInFlight can do a liveness check before firing
+      // the next phase — guards against the spike auto-proceed mid-process
+      // state advance that would otherwise spawn a second concurrent agent.
+      state.setSpawn(row.slug, row.number, spawn.pid);
       appendVaultComment(
         ticketPath,
         "Curator",
@@ -381,6 +385,7 @@ function sweepGreenLit(cfg: Config, state: State, summary: PollSummary): void {
     }
 
     applyLabels(repo, row.number, ["agent:assigned"]);
+    state.setSpawn(row.slug, row.number, spawn.pid);
 
     log.info("sweep: fired previously-deferred green-lit row", {
       slug: row.slug,
@@ -462,6 +467,20 @@ function isTerminalVaultState(state: string): boolean {
 }
 
 const STUCK_THRESHOLD_MS = 60 * 60 * 1000; // 60 min
+
+/** Cheap PID liveness probe via signal 0 (existence test, no signal sent).
+ * Returns false for null/<=0 inputs and for PIDs that ESRCH on probe. PID
+ * reuse is theoretically possible but the window is bounded — the drive
+ * loop reads each row at most once per poll tick (5 min default). */
+function isPidAlive(pid: number | null): boolean {
+  if (pid === null || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 /** Scan ~/.open-team/telemetry/runs.jsonl for the most recent line referencing
  * `ticketId`, return its latest timestamp (started-at or ended-at) in ms.
@@ -578,6 +597,7 @@ function driveInFlight(cfg: Config, state: State, summary: PollSummary): void {
         vault_ticket_id: row.vault_ticket_id,
       });
       clearLabels(repo, row.number, ["agent:assigned"]);
+      state.clearSpawn(row.slug, row.number);
       state.setTriageStatus(row.slug, row.number, "pipeline-held");
       summary.errors += 1;
       continue;
@@ -605,6 +625,7 @@ function driveInFlight(cfg: Config, state: State, summary: PollSummary): void {
       // transitions that didn't go through QA close (e.g. issue closed
       // externally before QA, ticket moved straight to archive).
       clearLabels(repo, row.number, ["agent:assigned"]);
+      state.clearSpawn(row.slug, row.number);
       state.setTriageStatus(row.slug, row.number, "pipeline-complete");
       continue;
     }
@@ -616,6 +637,7 @@ function driveInFlight(cfg: Config, state: State, summary: PollSummary): void {
         ticket: row.vault_ticket_id,
       });
       clearLabels(repo, row.number, ["agent:assigned"]);
+      state.clearSpawn(row.slug, row.number);
       state.setTriageStatus(row.slug, row.number, "pipeline-held");
       continue;
     }
@@ -653,6 +675,29 @@ function driveInFlight(cfg: Config, state: State, summary: PollSummary): void {
       continue;
     }
 
+    // State advanced — but check whether the prior spawn is still running
+    // before we fire the next phase. oteam's spike role has an S/H
+    // auto-proceed path that flips state to in-progress mid-process and
+    // keeps executing implementation work in the same `claude` session;
+    // without this guard, the moment dispatch observes the state advance
+    // it would spawn a SECOND oteam assign for in-progress while the first
+    // is still alive (#5: AGT-143/AGT-144 had paid-for-twice overlaps).
+    if (isPidAlive(row.spawned_pid)) {
+      log.info("drive: state advanced but prior spawn still alive; deferring", {
+        slug: row.slug,
+        number: row.number,
+        ticket: row.vault_ticket_id,
+        state: currentState,
+        previous_state: row.last_fired_for_state,
+        prior_pid: row.spawned_pid,
+      });
+      // Treat as if the phase hasn't actually transitioned yet — leave the
+      // last_fired_for_state in place so the next tick re-evaluates. The
+      // stuck-detection branch above protects against an indefinitely-alive
+      // prior process.
+      continue;
+    }
+
     // State advanced — fire the next phase.
     if (spawnsThisTick >= maxSpawns) {
       log.info("drive: spawn cap reached; deferring next phase to next tick", {
@@ -686,6 +731,7 @@ function driveInFlight(cfg: Config, state: State, summary: PollSummary): void {
       pid: spawn.pid,
     });
     state.setLastFiredForState(row.slug, row.number, currentState);
+    state.setSpawn(row.slug, row.number, spawn.pid);
     summary.fired += 1;
     spawnsThisTick += 1;
   }
@@ -709,12 +755,13 @@ export async function processIssue(args: {
 
   let triage;
   try {
-    triage = await triageIssue({
+    const outcome = await triageIssue({
       issue,
       repo,
       model: cfg.defaults.triage_model,
       bodyTruncate: cfg.defaults.body_truncate_chars,
     });
+    triage = outcome.result;
   } catch (e) {
     log.error("triage failed", {
       slug: repo.slug,
