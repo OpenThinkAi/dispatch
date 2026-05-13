@@ -19,7 +19,10 @@ Usage:
 Commands:
   poll                       One-shot: ingest, curate, orchestrate
                              --v2 --dry-run scans the spike sources+rules pipeline and prints
-                             what would happen (no triage, no sink writes, no archive)
+                             what would happen (no sink writes, no archive)
+                             Add --with-triage [--triage-limit=N] to classify github_issues
+                             items via the triage model (default limit 5) and surface the
+                             derived type + merged labels in the planned route
   watch [--interval SEC]     Foreground loop calling poll (default 300s); for dev/debug
   process <url-or-ref>       Manually ingest one issue (does NOT trigger curation)
   smoketest                  Exercise every external integration (gh, oteam, Claude SDK
@@ -67,7 +70,14 @@ async function main(argv: string[]): Promise<number> {
           console.error("`dispatch poll --v2` requires --dry-run (v2 execution not implemented yet).");
           return 2;
         }
-        return await pollV2DryRun();
+        const withTriage = args.includes("--with-triage");
+        const limitArg = args.find(a => a.startsWith("--triage-limit="));
+        const triageLimit = limitArg ? Number(limitArg.split("=")[1]) : 5;
+        if (!Number.isFinite(triageLimit) || triageLimit < 0) {
+          console.error(`invalid --triage-limit value: ${limitArg}`);
+          return 2;
+        }
+        return await pollV2DryRun({ withTriage, triageLimit });
       }
       const cfg = loadConfig();
       const r = await pollOnce(cfg);
