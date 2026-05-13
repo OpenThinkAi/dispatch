@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { loadConfig, configPath, repoBySlug } from "./config.ts";
 import { loadConfigV2 } from "./config-v2.ts";
+import { pollV2DryRun } from "./poll-v2.ts";
 import { log } from "./log.ts";
 import { fetchIssue, parseIssueRef } from "./github.ts";
 import { pollOnce, processIssue } from "./poll.ts";
@@ -17,6 +18,8 @@ Usage:
 
 Commands:
   poll                       One-shot: ingest, curate, orchestrate
+                             --v2 --dry-run scans the spike sources+rules pipeline and prints
+                             what would happen (no triage, no sink writes, no archive)
   watch [--interval SEC]     Foreground loop calling poll (default 300s); for dev/debug
   process <url-or-ref>       Manually ingest one issue (does NOT trigger curation)
   smoketest                  Exercise every external integration (gh, oteam, Claude SDK
@@ -58,6 +61,14 @@ async function main(argv: string[]): Promise<number> {
       return 0;
 
     case "poll": {
+      const args = sub ? [sub, ...rest] : rest;
+      if (args.includes("--v2")) {
+        if (!args.includes("--dry-run")) {
+          console.error("`dispatch poll --v2` requires --dry-run (v2 execution not implemented yet).");
+          return 2;
+        }
+        return await pollV2DryRun();
+      }
       const cfg = loadConfig();
       const r = await pollOnce(cfg);
       return r.errors > 0 ? 1 : 0;

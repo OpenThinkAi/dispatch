@@ -1,4 +1,6 @@
 import type {
+  ConfigV2,
+  IngestAction,
   IngestMatch,
   IngestRule,
   Item,
@@ -64,6 +66,22 @@ export function matchLifecycle(
   rules: LifecycleRule[],
 ): LifecycleRule[] {
   return rules.filter(r => matchesLifecycleWhen(event, r.when));
+}
+
+/**
+ * Resolve an item into a concrete plan: first try the rule list, then
+ * fall back to `[default]`, then `drop`. Pure — no side effects.
+ */
+export type IngestPlan =
+  | { via: "rule"; rule_name: string; action: IngestAction }
+  | { via: "default"; action: IngestAction }
+  | { via: "drop" };
+
+export function planIngest(item: Item, cfg: ConfigV2): IngestPlan {
+  const rule = matchIngest(item, cfg.ingest_rules);
+  if (rule) return { via: "rule", rule_name: rule.name, action: rule.do };
+  if (cfg.default_action) return { via: "default", action: cfg.default_action };
+  return { via: "drop" };
 }
 
 function matchesLifecycleWhen(event: LifecycleEvent, when: LifecycleMatch): boolean {
