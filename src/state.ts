@@ -28,6 +28,18 @@ export type SeenRow = {
   spawned_at: string | null;
 };
 
+export type V2SeenRow = {
+  source_name: string;
+  external_id: string;
+  content_hash: string;
+  vault_ticket_id: string | null;
+  status: string;
+  plan_via: string | null;
+  plan_rule_name: string | null;
+  first_seen_at: string;
+  last_processed_at: string;
+};
+
 export type CuratorDecisionRow = {
   slug: string;
   number: number;
@@ -260,6 +272,70 @@ export class State {
 
   allCursors(): Record<string, string> {
     return { ...this.cursors };
+  }
+
+  // ─── v2 seen (per (source_name, external_id)) ──────────────────────────
+
+  getV2Seen(sourceName: string, externalId: string): V2SeenRow | null {
+    const row = this.db
+      .query("SELECT * FROM v2_seen WHERE source_name = ? AND external_id = ?")
+      .get(sourceName, externalId) as V2SeenRow | null;
+    return row ?? null;
+  }
+
+  /**
+   * Insert or update a v2_seen row. `status` is the terminal outcome:
+   * "filed" | "dropped" | "skipped" | "security-held" | "error".
+   * Callers pass the planned action's `via` and `rule_name` so we can
+   * audit how the item was routed.
+   */
+  markV2Seen(args: {
+    source_name: string;
+    external_id: string;
+    content_hash: string;
+    vault_ticket_id: string | null;
+    status: string;
+    plan_via: string | null;
+    plan_rule_name: string | null;
+  }): void {
+    const now = new Date().toISOString();
+    const existing = this.getV2Seen(args.source_name, args.external_id);
+    if (existing) {
+      this.db.run(
+        `UPDATE v2_seen
+            SET content_hash = ?, vault_ticket_id = ?, status = ?,
+                plan_via = ?, plan_rule_name = ?, last_processed_at = ?
+          WHERE source_name = ? AND external_id = ?`,
+        [
+          args.content_hash,
+          args.vault_ticket_id,
+          args.status,
+          args.plan_via,
+          args.plan_rule_name,
+          now,
+          args.source_name,
+          args.external_id,
+        ],
+      );
+    } else {
+      this.db.run(
+        `INSERT INTO v2_seen
+            (source_name, external_id, content_hash, vault_ticket_id, status,
+             plan_via, plan_rule_name, first_seen_at, last_processed_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          args.source_name,
+          args.external_id,
+          args.content_hash,
+          args.vault_ticket_id,
+          args.status,
+          args.plan_via,
+          args.plan_rule_name,
+          now,
+          now,
+        ],
+      );
+    }
   }
 
   // ─── v2 cursors (per source name, not per repo slug) ────────────────────

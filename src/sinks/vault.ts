@@ -66,6 +66,26 @@ export function pullIntoVault(args: {
   return { ok: true, ref };
 }
 
+/**
+ * v2-friendly variant: file a GitHub-shaped URL into a vault/project,
+ * decoupled from the v0 RepoConfig. Same underlying `oteam pull github`
+ * call as `pullIntoVault`.
+ */
+export function pullUrlIntoVault(args: {
+  htmlUrl: string;
+  vault: string;
+  project: string;
+}): { ok: true; ref: string | null } | { ok: false; error: string } {
+  const r = oteam([
+    "pull", "github", args.htmlUrl,
+    "--vault", args.vault,
+    "--project", args.project,
+  ]);
+  if (!r.ok) return { ok: false, error: r.stderr };
+  const ref = extractTicketRef(r.stdout);
+  return { ok: true, ref };
+}
+
 function extractTicketRef(stdout: string): string | null {
   const m = stdout.match(/\b(AGT-\d+)\b/);
   return m ? m[1] : null;

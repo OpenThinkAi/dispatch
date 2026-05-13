@@ -1,13 +1,16 @@
+import { createHash } from "node:crypto";
 import { configPath } from "./config.ts";
 import { loadConfigV2 } from "./config-v2.ts";
 import { planIngest, type IngestPlan } from "./rules.ts";
-import { readFolder } from "./sources/folder.ts";
+import { pullUrlIntoVault } from "./sinks/vault.ts";
+import { archiveFolderItem, readFolder } from "./sources/folder.ts";
 import { readGitHubIssues } from "./sources/github_issues.ts";
 import { State } from "./state.ts";
 import { triageIssue } from "./triage.ts";
 import type {
   ConfigV2,
   GitHubIssue,
+  IngestAction,
   Item,
   RepoConfig,
   SourceConfig,
@@ -171,6 +174,272 @@ export function deriveType(t: TriageResult): string | null {
     if (t.labels_to_add.includes(p)) return p;
   }
   return null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Execute path — `dispatch poll --v2` (no --dry-run).
+// Scope of THIS slice: sink=vault on github_issues with autopilot=off, plus
+// sink=drop. Everything else is logged as "unimplemented" and does NOT
+// advance the cursor (so the next implemented slice picks it up).
+// ─────────────────────────────────────────────────────────────────────────
+
+export async function pollV2Once(): Promise<number> {
+  const cfg = loadConfigV2(configPath());
+  const state = new State(cfg.defaults.state_dir);
+  console.log(
+    `[v2 poll] executing across ${cfg.sources.length} source${plural(cfg.sources.length)} ` +
+      `from ${cfg.defaults.config_path}\n`,
+  );
+  try {
+    return await runExecute(cfg, state);
+  } finally {
+    state.close();
+  }
+}
+
+type ExecOutcome =
+  | { kind: "filed"; ticket_ref: string | null }
+  | { kind: "dropped" }
+  | { kind: "already-filed" }
+  | { kind: "unimplemented"; reason: string }
+  | { kind: "error"; error: string };
+
+async function runExecute(cfg: ConfigV2, state: State): Promise<number> {
+  let totals = { filed: 0, dropped: 0, alreadyFiled: 0, unimplemented: 0, errored: 0, sourceErrors: 0 };
+
+  for (const source of cfg.sources) {
+    if (source.kind === "github_issues") {
+      const seeded = state.ensureV2CursorSeeded(source.name, new Date().toISOString());
+      if (seeded) {
+        console.log(`${source.name} (${source.kind}): seeded cursor to now (first sight; no backfill)`);
+        console.log();
+        continue;
+      }
+    }
+
+    let items: Item[] | null;
+    try {
+      items = readSource(source, state);
+    } catch (e) {
+      console.log(`${source.name} (${source.kind}): SOURCE ERROR — ${(e as Error).message}`);
+      console.log();
+      totals.sourceErrors++;
+      continue;
+    }
+    if (items === null) {
+      console.log(`${source.name} (${source.kind}): SKIPPED — no v2 reader yet`);
+      console.log();
+      continue;
+    }
+
+    console.log(`${source.name} (${source.kind}, ${items.length} item${plural(items.length)}):`);
+    if (items.length === 0) {
+      console.log("  (no new items)");
+      console.log();
+      continue;
+    }
+
+    let canAdvanceCursor = true;
+    let maxUpdatedAt = state.getV2Cursor(source.name) ?? "";
+
+    for (const item of items) {
+      const plan = planIngest(item, cfg);
+      let outcome: ExecOutcome;
+      try {
+        outcome = await executeItem(item, source, plan, state);
+      } catch (e) {
+        outcome = { kind: "error", error: (e as Error).message };
+        state.markV2Seen({
+          source_name: source.name,
+          external_id: item.external_id,
+          content_hash: contentHash(item),
+          vault_ticket_id: null,
+          status: "error",
+          plan_via: plan.via,
+          plan_rule_name: plan.via === "rule" ? plan.rule_name : null,
+        });
+      }
+      console.log(`  • "${item.title}" → ${formatPlan(plan)}   ${formatOutcome(outcome)}`);
+      bumpCounter(totals, outcome);
+      if (outcome.kind === "unimplemented" || outcome.kind === "error") {
+        canAdvanceCursor = false;
+      }
+      // Folder items are deduped by the filesystem, not a cursor. Move them
+      // out of the source dir on any terminal outcome so the next tick doesn't
+      // re-pick-them-up.
+      if (
+        source.kind === "folder" &&
+        (outcome.kind === "filed" || outcome.kind === "dropped" || outcome.kind === "already-filed")
+      ) {
+        try {
+          archiveFolderItem(source, item);
+        } catch (e) {
+          console.log(`    (archive failed: ${(e as Error).message})`);
+        }
+      }
+      if (source.kind === "github_issues") {
+        const updated = (item.raw as GitHubIssue).updated_at;
+        if (updated && updated > maxUpdatedAt) maxUpdatedAt = updated;
+      }
+    }
+
+    if (source.kind === "github_issues" && canAdvanceCursor && maxUpdatedAt) {
+      state.setV2Cursor(source.name, maxUpdatedAt);
+      console.log(`  cursor → ${maxUpdatedAt}`);
+    } else if (source.kind === "github_issues" && !canAdvanceCursor) {
+      console.log(`  cursor NOT advanced (errors or unimplemented items will retry next tick)`);
+    }
+    console.log();
+  }
+
+  console.log(
+    `[v2 poll] filed=${totals.filed} dropped=${totals.dropped} ` +
+      `already=${totals.alreadyFiled} unimpl=${totals.unimplemented} ` +
+      `errored=${totals.errored} source-errors=${totals.sourceErrors}`,
+  );
+  return totals.errored > 0 || totals.sourceErrors > 0 ? 1 : 0;
+}
+
+async function executeItem(
+  item: Item,
+  source: SourceConfig,
+  plan: IngestPlan,
+  state: State,
+): Promise<ExecOutcome> {
+  const existing = state.getV2Seen(source.name, item.external_id);
+  if (existing && existing.status === "filed") {
+    return { kind: "already-filed" };
+  }
+
+  if (plan.via === "drop") {
+    state.markV2Seen({
+      source_name: source.name,
+      external_id: item.external_id,
+      content_hash: contentHash(item),
+      vault_ticket_id: null,
+      status: "dropped",
+      plan_via: plan.via,
+      plan_rule_name: null,
+    });
+    return { kind: "dropped" };
+  }
+
+  const action: IngestAction = plan.action;
+  if (action.skip) {
+    state.markV2Seen({
+      source_name: source.name,
+      external_id: item.external_id,
+      content_hash: contentHash(item),
+      vault_ticket_id: null,
+      status: "dropped",
+      plan_via: plan.via,
+      plan_rule_name: plan.via === "rule" ? plan.rule_name : null,
+    });
+    return { kind: "dropped" };
+  }
+
+  const sink = action.sink ?? "vault";
+  const autopilot = action.autopilot ?? "off";
+
+  if (sink === "drop") {
+    state.markV2Seen({
+      source_name: source.name,
+      external_id: item.external_id,
+      content_hash: contentHash(item),
+      vault_ticket_id: null,
+      status: "dropped",
+      plan_via: plan.via,
+      plan_rule_name: plan.via === "rule" ? plan.rule_name : null,
+    });
+    return { kind: "dropped" };
+  }
+
+  if (sink === "security-inbox") {
+    return { kind: "unimplemented", reason: "security-inbox sink not implemented yet" };
+  }
+
+  // sink === "vault" from here on
+  if (source.kind !== "github_issues") {
+    return { kind: "unimplemented", reason: `vault sink not implemented for ${source.kind} source yet` };
+  }
+  if (autopilot !== "off") {
+    return { kind: "unimplemented", reason: `autopilot="${autopilot}" not implemented yet` };
+  }
+  if (!action.vault || !action.project) {
+    return {
+      kind: "error",
+      error: `sink=vault requires both do.vault and do.project; got vault=${action.vault ?? "(unset)"} project=${action.project ?? "(unset)"}`,
+    };
+  }
+
+  if (!item.url) {
+    return { kind: "error", error: "github_issues item has no URL to pull" };
+  }
+
+  const r = pullUrlIntoVault({ htmlUrl: item.url, vault: action.vault, project: action.project });
+  if (!r.ok) {
+    state.markV2Seen({
+      source_name: source.name,
+      external_id: item.external_id,
+      content_hash: contentHash(item),
+      vault_ticket_id: null,
+      status: "error",
+      plan_via: plan.via,
+      plan_rule_name: plan.via === "rule" ? plan.rule_name : null,
+    });
+    return { kind: "error", error: r.error };
+  }
+  state.markV2Seen({
+    source_name: source.name,
+    external_id: item.external_id,
+    content_hash: contentHash(item),
+    vault_ticket_id: r.ref,
+    status: "filed",
+    plan_via: plan.via,
+    plan_rule_name: plan.via === "rule" ? plan.rule_name : null,
+  });
+  return { kind: "filed", ticket_ref: r.ref };
+}
+
+function contentHash(item: Item): string {
+  return createHash("sha256")
+    .update(item.title + "\n---\n" + item.body)
+    .digest("hex");
+}
+
+function formatOutcome(o: ExecOutcome): string {
+  switch (o.kind) {
+    case "filed":
+      return o.ticket_ref ? `FILED ${o.ticket_ref}` : `FILED (no ref)`;
+    case "dropped":
+      return "DROPPED";
+    case "already-filed":
+      return "(already filed)";
+    case "unimplemented":
+      return `UNIMPL: ${o.reason}`;
+    case "error":
+      return `ERROR: ${o.error}`;
+  }
+}
+
+function bumpCounter(t: { filed: number; dropped: number; alreadyFiled: number; unimplemented: number; errored: number; sourceErrors: number }, o: ExecOutcome): void {
+  switch (o.kind) {
+    case "filed":
+      t.filed++;
+      break;
+    case "dropped":
+      t.dropped++;
+      break;
+    case "already-filed":
+      t.alreadyFiled++;
+      break;
+    case "unimplemented":
+      t.unimplemented++;
+      break;
+    case "error":
+      t.errored++;
+      break;
+  }
 }
 
 function readSource(source: SourceConfig, state: State): Item[] | null {

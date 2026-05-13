@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 import { loadConfig, configPath, repoBySlug } from "./config.ts";
 import { loadConfigV2 } from "./config-v2.ts";
-import { pollV2DryRun } from "./poll-v2.ts";
+import { pollV2DryRun, pollV2Once } from "./poll-v2.ts";
 import { log } from "./log.ts";
 import { fetchIssue, parseIssueRef } from "./github.ts";
 import { pollOnce, processIssue } from "./poll.ts";
@@ -18,11 +18,12 @@ Usage:
 
 Commands:
   poll                       One-shot: ingest, curate, orchestrate
-                             --v2 --dry-run scans the spike sources+rules pipeline and prints
-                             what would happen (no sink writes, no archive)
-                             Add --with-triage [--triage-limit=N] to classify github_issues
-                             items via the triage model (default limit 5) and surface the
-                             derived type + merged labels in the planned route
+                             --v2 executes the spike sources+rules pipeline. Today's scope:
+                             sink=vault on github_issues with autopilot=off, plus sink=drop.
+                             Other sinks/autopilots log UNIMPL and are not yet processed.
+                             Add --dry-run for a read-only preview.
+                             Add --with-triage [--triage-limit=N] (dry-run only for now) to
+                             classify github_issues items via the triage model.
   watch [--interval SEC]     Foreground loop calling poll (default 300s); for dev/debug
   process <url-or-ref>       Manually ingest one issue (does NOT trigger curation)
   smoketest                  Exercise every external integration (gh, oteam, Claude SDK
@@ -66,18 +67,17 @@ async function main(argv: string[]): Promise<number> {
     case "poll": {
       const args = sub ? [sub, ...rest] : rest;
       if (args.includes("--v2")) {
-        if (!args.includes("--dry-run")) {
-          console.error("`dispatch poll --v2` requires --dry-run (v2 execution not implemented yet).");
-          return 2;
+        if (args.includes("--dry-run")) {
+          const withTriage = args.includes("--with-triage");
+          const limitArg = args.find(a => a.startsWith("--triage-limit="));
+          const triageLimit = limitArg ? Number(limitArg.split("=")[1]) : 5;
+          if (!Number.isFinite(triageLimit) || triageLimit < 0) {
+            console.error(`invalid --triage-limit value: ${limitArg}`);
+            return 2;
+          }
+          return await pollV2DryRun({ withTriage, triageLimit });
         }
-        const withTriage = args.includes("--with-triage");
-        const limitArg = args.find(a => a.startsWith("--triage-limit="));
-        const triageLimit = limitArg ? Number(limitArg.split("=")[1]) : 5;
-        if (!Number.isFinite(triageLimit) || triageLimit < 0) {
-          console.error(`invalid --triage-limit value: ${limitArg}`);
-          return 2;
-        }
-        return await pollV2DryRun({ withTriage, triageLimit });
+        return await pollV2Once();
       }
       const cfg = loadConfig();
       const r = await pollOnce(cfg);
