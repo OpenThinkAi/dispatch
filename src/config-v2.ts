@@ -198,6 +198,20 @@ export function loadConfigV2(path: string): ConfigV2 {
     }
   }
 
+  // bot_identity is required when any rule (or [default]) sets do.autopilot to
+  // "fire" or "drive". The curator's claim step writes assignees as that login
+  // before the orchestrator spawns — empty identity = no claim = no spawn.
+  const hasFireDriveRule =
+    data.rule.ingest.some(r => r.do.autopilot === "fire" || r.do.autopilot === "drive") ||
+    data.default?.autopilot === "fire" ||
+    data.default?.autopilot === "drive";
+  if (hasFireDriveRule && !data.defaults.bot_identity) {
+    throw new Error(
+      `defaults.bot_identity is required when any rule has do.autopilot = "fire" or "drive". ` +
+        `Set it to the GitHub login that should claim issues (e.g. your own login).`,
+    );
+  }
+
   return {
     defaults: {
       state_dir: expandHome(data.defaults.state_dir),

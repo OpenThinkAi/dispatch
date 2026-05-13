@@ -2,11 +2,12 @@ import { createHash } from "node:crypto";
 import { configPath } from "./config.ts";
 import { loadConfigV2 } from "./config-v2.ts";
 import { curateTicket } from "./curator.ts";
-import { addLabels } from "./github.ts";
+import { addLabels, claimIssue } from "./github.ts";
 import { planIngest, type IngestPlan } from "./rules.ts";
 import {
   executeGhCommentDecision,
   executeHoldDecision,
+  spawnOteamAssign,
 } from "./sinks/curator-actions.ts";
 import { holdItemForSecurityReview } from "./sinks/security.ts";
 import { pullUrlIntoVault } from "./sinks/vault.ts";
@@ -229,10 +230,19 @@ export async function pollV2Once(opts: ExecOptions): Promise<number> {
   }
 }
 
+type SpawnOutcome =
+  | { kind: "spawned"; status: "fired" | "driving"; pid: number }
+  | { kind: "lost-race"; assignees: string[] }
+  | { kind: "issue-closed" }
+  | { kind: "no-write-access" }
+  | { kind: "claim-error"; error: string }
+  | { kind: "spawn-failed"; error: string };
+
 type CuratorOutcome = {
   decision: "fire" | "gh-comment" | "hold";
   reasoning: string;
   cost_usd: number | null;
+  spawn?: SpawnOutcome;
 };
 
 type ExecOutcome =
@@ -456,9 +466,10 @@ async function executeItem(
   if (source.kind !== "github_issues") {
     return { kind: "unimplemented", reason: `vault sink not implemented for ${source.kind} source yet` };
   }
-  if (autopilot !== "off" && autopilot !== "curate-only") {
-    return { kind: "unimplemented", reason: `autopilot="${autopilot}" not implemented yet` };
-  }
+  // autopilot=drive is partly implemented in this slice: initial fire works
+  // the same as autopilot=fire; the re-fire-on-state-advance behavior lives
+  // with the lifecycle engine (separate phase). Until then, autopilot=drive
+  // tickets land in state="driving" and stay there.
   if (!action.vault || !action.project) {
     return {
       kind: "error",
@@ -596,14 +607,29 @@ async function executeItem(
         status: "held-for-human",
       });
     } else {
-      // "fire" — for curate-only, green-light but stop here. Sub-slice D
-      // wires this into the orchestrator spawn for autopilot=fire/drive.
-      state.updateV2SeenAfterCurator({
-        source_name: source.name,
-        external_id: item.external_id,
-        curator_decision: "fire",
-        status: "green-lit",
-      });
+      // curator decision = "fire"
+      if (autopilot === "curate-only") {
+        // green-light but stop here — no orchestrator
+        state.updateV2SeenAfterCurator({
+          source_name: source.name,
+          external_id: item.external_id,
+          curator_decision: "fire",
+          status: "green-lit",
+        });
+      } else {
+        // autopilot=fire or drive — claim + spawn orchestrator
+        const issueNumber = (item.raw as { number?: number }).number ?? 0;
+        const spawn = await fireOrchestrator({
+          slug: source.slug,
+          number: issueNumber,
+          botIdentity: cfg.defaults.bot_identity,
+          ticketPath,
+          logDir: cfg.defaults.log_dir,
+          autopilot,
+        });
+        curator.spawn = spawn;
+        recordSpawnOutcome(state, source.name, item.external_id, spawn);
+      }
     }
   } catch (e) {
     return {
@@ -615,6 +641,70 @@ async function executeItem(
   }
 
   return { kind: "filed", ticket_ref: r.ref, labels_added: labelsAdded, curator };
+}
+
+/**
+ * Claim the GH issue for `botIdentity`, then spawn `oteam assign --inline`
+ * for the just-filed ticket. Returns a discriminated outcome the caller
+ * can both log and persist.
+ */
+async function fireOrchestrator(args: {
+  slug: string;
+  number: number;
+  botIdentity: string;
+  ticketPath: string;
+  logDir: string;
+  autopilot: "fire" | "drive";
+}): Promise<SpawnOutcome> {
+  if (!args.botIdentity) {
+    return { kind: "claim-error", error: "defaults.bot_identity is empty" };
+  }
+  const claim = claimIssue(args.slug, args.number, args.botIdentity);
+  if (!claim.ok) {
+    switch (claim.reason) {
+      case "issue-closed":
+        return { kind: "issue-closed" };
+      case "already-claimed":
+        return { kind: "lost-race", assignees: claim.assignees };
+      case "no-write-access":
+        return { kind: "no-write-access" };
+      case "api-error":
+        return { kind: "claim-error", error: claim.error };
+    }
+  }
+  const r = spawnOteamAssign(args.ticketPath, args.logDir);
+  if (!r.ok) return { kind: "spawn-failed", error: r.error };
+  return {
+    kind: "spawned",
+    status: args.autopilot === "drive" ? "driving" : "fired",
+    pid: r.pid,
+  };
+}
+
+/** Map a SpawnOutcome to the right v2_seen status + spawned_pid update. */
+function recordSpawnOutcome(
+  state: State,
+  sourceName: string,
+  externalId: string,
+  spawn: SpawnOutcome,
+): void {
+  const base = { source_name: sourceName, external_id: externalId, curator_decision: "fire" };
+  switch (spawn.kind) {
+    case "spawned":
+      state.updateV2SeenAfterCurator({ ...base, status: spawn.status, spawned_pid: spawn.pid });
+      return;
+    case "lost-race":
+      state.updateV2SeenAfterCurator({ ...base, status: "lost-race" });
+      return;
+    case "issue-closed":
+      state.updateV2SeenAfterCurator({ ...base, status: "gh-resolved" });
+      return;
+    case "no-write-access":
+    case "claim-error":
+    case "spawn-failed":
+      state.updateV2SeenAfterCurator({ ...base, status: "error" });
+      return;
+  }
 }
 
 function contentHash(item: Item): string {
@@ -630,7 +720,8 @@ function formatOutcome(o: ExecOutcome): string {
       const labels = o.labels_added > 0 ? ` +${o.labels_added} labels` : "";
       if (o.curator) {
         const cost = o.curator.cost_usd !== null ? ` cost=$${o.curator.cost_usd.toFixed(4)}` : "";
-        return `${ref}${labels}  curator: ${o.curator.decision}${cost}`;
+        const spawn = o.curator.spawn ? `  → ${formatSpawn(o.curator.spawn)}` : "";
+        return `${ref}${labels}  curator: ${o.curator.decision}${cost}${spawn}`;
       }
       if (o.curator_error) {
         return `${ref}${labels}  curator ERROR: ${o.curator_error}`;
@@ -647,6 +738,23 @@ function formatOutcome(o: ExecOutcome): string {
       return `UNIMPL: ${o.reason}`;
     case "error":
       return `ERROR: ${o.error}`;
+  }
+}
+
+function formatSpawn(s: SpawnOutcome): string {
+  switch (s.kind) {
+    case "spawned":
+      return `SPAWNED ${s.status.toUpperCase()} pid=${s.pid}`;
+    case "lost-race":
+      return `LOST-RACE (assignees=[${s.assignees.join(", ")}])`;
+    case "issue-closed":
+      return "ISSUE-CLOSED";
+    case "no-write-access":
+      return "NO-WRITE-ACCESS (token can't set assignees)";
+    case "claim-error":
+      return `CLAIM-ERROR: ${s.error}`;
+    case "spawn-failed":
+      return `SPAWN-FAILED: ${s.error}`;
   }
 }
 

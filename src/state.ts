@@ -362,8 +362,9 @@ export class State {
   }
 
   /**
-   * Update a v2_seen row after the curator runs: records the curator's
-   * decision string and the new terminal status without disturbing
+   * Update a v2_seen row after the curator runs (and, for autopilot=fire/drive,
+   * after the orchestrator spawn attempt): records the curator decision, new
+   * status, and optional spawned_pid in one statement. Doesn't touch
    * content_hash, vault_ticket_id, plan_via, or plan_rule_name.
    */
   updateV2SeenAfterCurator(args: {
@@ -371,13 +372,17 @@ export class State {
     external_id: string;
     curator_decision: string;
     status: string;
+    spawned_pid?: number | null;
   }): void {
     const now = new Date().toISOString();
+    const pid = args.spawned_pid ?? null;
+    const spawnedAt = pid !== null ? now : null;
     this.db.run(
       `UPDATE v2_seen
-          SET curator_decision = ?, status = ?, last_processed_at = ?
+          SET curator_decision = ?, status = ?, last_processed_at = ?,
+              spawned_pid = ?, spawned_at = ?
         WHERE source_name = ? AND external_id = ?`,
-      [args.curator_decision, args.status, now, args.source_name, args.external_id],
+      [args.curator_decision, args.status, now, pid, spawnedAt, args.source_name, args.external_id],
     );
   }
 
