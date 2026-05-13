@@ -1,10 +1,16 @@
 import { createHash } from "node:crypto";
 import { configPath } from "./config.ts";
 import { loadConfigV2 } from "./config-v2.ts";
+import { curateTicket } from "./curator.ts";
 import { addLabels } from "./github.ts";
 import { planIngest, type IngestPlan } from "./rules.ts";
+import {
+  executeGhCommentDecision,
+  executeHoldDecision,
+} from "./sinks/curator-actions.ts";
 import { holdItemForSecurityReview } from "./sinks/security.ts";
 import { pullUrlIntoVault } from "./sinks/vault.ts";
+import { findVaultTicketPath, readRecentVaultTickets } from "./vault-read.ts";
 import { archiveFolderItem, readFolder } from "./sources/folder.ts";
 import { readGitHubIssues } from "./sources/github_issues.ts";
 import { readGitHubPrs } from "./sources/github_prs.ts";
@@ -223,8 +229,20 @@ export async function pollV2Once(opts: ExecOptions): Promise<number> {
   }
 }
 
+type CuratorOutcome = {
+  decision: "fire" | "gh-comment" | "hold";
+  reasoning: string;
+  cost_usd: number | null;
+};
+
 type ExecOutcome =
-  | { kind: "filed"; ticket_ref: string | null; labels_added: number }
+  | {
+      kind: "filed";
+      ticket_ref: string | null;
+      labels_added: number;
+      curator?: CuratorOutcome;
+      curator_error?: string;
+    }
   | { kind: "dropped" }
   | { kind: "security-held"; path: string }
   | { kind: "already-filed" }
@@ -438,7 +456,7 @@ async function executeItem(
   if (source.kind !== "github_issues") {
     return { kind: "unimplemented", reason: `vault sink not implemented for ${source.kind} source yet` };
   }
-  if (autopilot !== "off") {
+  if (autopilot !== "off" && autopilot !== "curate-only") {
     return { kind: "unimplemented", reason: `autopilot="${autopilot}" not implemented yet` };
   }
   if (!action.vault || !action.project) {
@@ -496,7 +514,107 @@ async function executeItem(
     plan_via: plan.via,
     plan_rule_name: plan.via === "rule" ? plan.rule_name : null,
   });
-  return { kind: "filed", ticket_ref: r.ref, labels_added: labelsAdded };
+
+  // autopilot=off → terminal here.
+  if (autopilot === "off") {
+    return { kind: "filed", ticket_ref: r.ref, labels_added: labelsAdded };
+  }
+
+  // autopilot=curate-only → run curator, apply decision. (fire/drive return
+  // unimplemented above; sub-slice D adds the orchestrator spawn.)
+  if (!r.ref) {
+    return {
+      kind: "filed",
+      ticket_ref: null,
+      labels_added: labelsAdded,
+      curator_error: "no ticket ref from oteam — cannot curate",
+    };
+  }
+  const ticketPath = findVaultTicketPath(action.vault, r.ref);
+  if (!ticketPath) {
+    return {
+      kind: "filed",
+      ticket_ref: r.ref,
+      labels_added: labelsAdded,
+      curator_error: `vault ticket file for ${r.ref} not found under vault ${action.vault}`,
+    };
+  }
+
+  const fakeRepo: RepoConfig = {
+    slug: item.repo ?? "",
+    vault: action.vault,
+    project: action.project,
+    can_label: source.can_label,
+    autopilot,
+  };
+  const recentTickets = readRecentVaultTickets({
+    vault: action.vault,
+    repo: item.repo,
+    windowDays: cfg.defaults.recent_vault_tickets_window_days,
+    cap: cfg.defaults.recent_vault_tickets_cap,
+  });
+
+  let curator: CuratorOutcome;
+  try {
+    const out = await curateTicket({
+      ticketBodyPath: ticketPath,
+      repo: fakeRepo,
+      recentVaultTickets: recentTickets,
+      curatorModel: cfg.defaults.curator_model,
+      perCallMaxBudgetUsd: cfg.defaults.per_call_max_budget_usd,
+    });
+    curator = {
+      decision: out.decision.action,
+      reasoning: out.decision.reasoning,
+      cost_usd: out.cost_usd,
+    };
+    const issueNumber = (item.raw as { number?: number }).number ?? 0;
+    if (out.decision.action === "gh-comment") {
+      executeGhCommentDecision({
+        repo: fakeRepo,
+        number: issueNumber,
+        decision: out.decision,
+        ticketPath,
+      });
+      state.updateV2SeenAfterCurator({
+        source_name: source.name,
+        external_id: item.external_id,
+        curator_decision: "gh-comment",
+        status: "gh-resolved",
+      });
+    } else if (out.decision.action === "hold") {
+      executeHoldDecision({
+        repo: fakeRepo,
+        number: issueNumber,
+        decision: out.decision,
+        ticketPath,
+      });
+      state.updateV2SeenAfterCurator({
+        source_name: source.name,
+        external_id: item.external_id,
+        curator_decision: "hold",
+        status: "held-for-human",
+      });
+    } else {
+      // "fire" — for curate-only, green-light but stop here. Sub-slice D
+      // wires this into the orchestrator spawn for autopilot=fire/drive.
+      state.updateV2SeenAfterCurator({
+        source_name: source.name,
+        external_id: item.external_id,
+        curator_decision: "fire",
+        status: "green-lit",
+      });
+    }
+  } catch (e) {
+    return {
+      kind: "filed",
+      ticket_ref: r.ref,
+      labels_added: labelsAdded,
+      curator_error: (e as Error).message,
+    };
+  }
+
+  return { kind: "filed", ticket_ref: r.ref, labels_added: labelsAdded, curator };
 }
 
 function contentHash(item: Item): string {
@@ -509,7 +627,15 @@ function formatOutcome(o: ExecOutcome): string {
   switch (o.kind) {
     case "filed": {
       const ref = o.ticket_ref ? `FILED ${o.ticket_ref}` : `FILED (no ref)`;
-      return o.labels_added > 0 ? `${ref} +${o.labels_added} labels` : ref;
+      const labels = o.labels_added > 0 ? ` +${o.labels_added} labels` : "";
+      if (o.curator) {
+        const cost = o.curator.cost_usd !== null ? ` cost=$${o.curator.cost_usd.toFixed(4)}` : "";
+        return `${ref}${labels}  curator: ${o.curator.decision}${cost}`;
+      }
+      if (o.curator_error) {
+        return `${ref}${labels}  curator ERROR: ${o.curator_error}`;
+      }
+      return `${ref}${labels}`;
     }
     case "dropped":
       return "DROPPED";

@@ -361,6 +361,26 @@ export class State {
     }
   }
 
+  /**
+   * Update a v2_seen row after the curator runs: records the curator's
+   * decision string and the new terminal status without disturbing
+   * content_hash, vault_ticket_id, plan_via, or plan_rule_name.
+   */
+  updateV2SeenAfterCurator(args: {
+    source_name: string;
+    external_id: string;
+    curator_decision: string;
+    status: string;
+  }): void {
+    const now = new Date().toISOString();
+    this.db.run(
+      `UPDATE v2_seen
+          SET curator_decision = ?, status = ?, last_processed_at = ?
+        WHERE source_name = ? AND external_id = ?`,
+      [args.curator_decision, args.status, now, args.source_name, args.external_id],
+    );
+  }
+
   // ─── v2 cursors (per source name, not per repo slug) ────────────────────
 
   getV2Cursor(sourceName: string): string | null {
