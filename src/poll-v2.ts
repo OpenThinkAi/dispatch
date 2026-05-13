@@ -1,7 +1,9 @@
 import { createHash } from "node:crypto";
 import { configPath } from "./config.ts";
 import { loadConfigV2 } from "./config-v2.ts";
+import { addLabels } from "./github.ts";
 import { planIngest, type IngestPlan } from "./rules.ts";
+import { holdItemForSecurityReview } from "./sinks/security.ts";
 import { pullUrlIntoVault } from "./sinks/vault.ts";
 import { archiveFolderItem, readFolder } from "./sources/folder.ts";
 import { readGitHubIssues } from "./sources/github_issues.ts";
@@ -200,14 +202,23 @@ export async function pollV2Once(): Promise<number> {
 }
 
 type ExecOutcome =
-  | { kind: "filed"; ticket_ref: string | null }
+  | { kind: "filed"; ticket_ref: string | null; labels_added: number }
   | { kind: "dropped" }
+  | { kind: "security-held"; path: string }
   | { kind: "already-filed" }
   | { kind: "unimplemented"; reason: string }
   | { kind: "error"; error: string };
 
 async function runExecute(cfg: ConfigV2, state: State): Promise<number> {
-  let totals = { filed: 0, dropped: 0, alreadyFiled: 0, unimplemented: 0, errored: 0, sourceErrors: 0 };
+  let totals = {
+    filed: 0,
+    dropped: 0,
+    securityHeld: 0,
+    alreadyFiled: 0,
+    unimplemented: 0,
+    errored: 0,
+    sourceErrors: 0,
+  };
 
   for (const source of cfg.sources) {
     if (
@@ -252,7 +263,7 @@ async function runExecute(cfg: ConfigV2, state: State): Promise<number> {
       const plan = planIngest(item, cfg);
       let outcome: ExecOutcome;
       try {
-        outcome = await executeItem(item, source, plan, state);
+        outcome = await executeItem(item, source, plan, state, cfg);
       } catch (e) {
         outcome = { kind: "error", error: (e as Error).message };
         state.markV2Seen({
@@ -275,7 +286,10 @@ async function runExecute(cfg: ConfigV2, state: State): Promise<number> {
       // re-pick-them-up.
       if (
         source.kind === "folder" &&
-        (outcome.kind === "filed" || outcome.kind === "dropped" || outcome.kind === "already-filed")
+        (outcome.kind === "filed" ||
+          outcome.kind === "dropped" ||
+          outcome.kind === "security-held" ||
+          outcome.kind === "already-filed")
       ) {
         try {
           archiveFolderItem(source, item);
@@ -309,8 +323,9 @@ async function runExecute(cfg: ConfigV2, state: State): Promise<number> {
 
   console.log(
     `[v2 poll] filed=${totals.filed} dropped=${totals.dropped} ` +
-      `already=${totals.alreadyFiled} unimpl=${totals.unimplemented} ` +
-      `errored=${totals.errored} source-errors=${totals.sourceErrors}`,
+      `security-held=${totals.securityHeld} already=${totals.alreadyFiled} ` +
+      `unimpl=${totals.unimplemented} errored=${totals.errored} ` +
+      `source-errors=${totals.sourceErrors}`,
   );
   return totals.errored > 0 || totals.sourceErrors > 0 ? 1 : 0;
 }
@@ -320,6 +335,7 @@ async function executeItem(
   source: SourceConfig,
   plan: IngestPlan,
   state: State,
+  cfg: ConfigV2,
 ): Promise<ExecOutcome> {
   const existing = state.getV2Seen(source.name, item.external_id);
   if (existing && existing.status === "filed") {
@@ -370,7 +386,21 @@ async function executeItem(
   }
 
   if (sink === "security-inbox") {
-    return { kind: "unimplemented", reason: "security-inbox sink not implemented yet" };
+    const held = holdItemForSecurityReview({
+      item,
+      flag: null, // triage's security_flag isn't yet threaded into execute mode
+      stateDir: cfg.defaults.state_dir,
+    });
+    state.markV2Seen({
+      source_name: source.name,
+      external_id: item.external_id,
+      content_hash: contentHash(item),
+      vault_ticket_id: null,
+      status: "security-held",
+      plan_via: plan.via,
+      plan_rule_name: plan.via === "rule" ? plan.rule_name : null,
+    });
+    return { kind: "security-held", path: held.path };
   }
 
   // sink === "vault" from here on
@@ -404,6 +434,28 @@ async function executeItem(
     });
     return { kind: "error", error: r.error };
   }
+
+  // do.add_labels — apply post-file. We're already narrowed to a github_issues
+  // source here. Skip when can_label=false. Failures don't fail the file;
+  // the vault ticket already exists.
+  let labelsAdded = 0;
+  const wantLabels = action.add_labels ?? [];
+  if (wantLabels.length > 0) {
+    if (!source.can_label) {
+      console.log(`    (add_labels skipped: source.can_label=false on ${source.name})`);
+    } else {
+      const issueNumber = (item.raw as { number?: number }).number;
+      if (typeof issueNumber === "number") {
+        try {
+          addLabels(source.slug, issueNumber, wantLabels);
+          labelsAdded = wantLabels.length;
+        } catch (e) {
+          console.log(`    (add_labels failed for ${source.slug}#${issueNumber}: ${(e as Error).message})`);
+        }
+      }
+    }
+  }
+
   state.markV2Seen({
     source_name: source.name,
     external_id: item.external_id,
@@ -413,7 +465,7 @@ async function executeItem(
     plan_via: plan.via,
     plan_rule_name: plan.via === "rule" ? plan.rule_name : null,
   });
-  return { kind: "filed", ticket_ref: r.ref };
+  return { kind: "filed", ticket_ref: r.ref, labels_added: labelsAdded };
 }
 
 function contentHash(item: Item): string {
@@ -424,10 +476,14 @@ function contentHash(item: Item): string {
 
 function formatOutcome(o: ExecOutcome): string {
   switch (o.kind) {
-    case "filed":
-      return o.ticket_ref ? `FILED ${o.ticket_ref}` : `FILED (no ref)`;
+    case "filed": {
+      const ref = o.ticket_ref ? `FILED ${o.ticket_ref}` : `FILED (no ref)`;
+      return o.labels_added > 0 ? `${ref} +${o.labels_added} labels` : ref;
+    }
     case "dropped":
       return "DROPPED";
+    case "security-held":
+      return `SECURITY-HELD → ${o.path}`;
     case "already-filed":
       return "(already filed)";
     case "unimplemented":
@@ -437,13 +493,27 @@ function formatOutcome(o: ExecOutcome): string {
   }
 }
 
-function bumpCounter(t: { filed: number; dropped: number; alreadyFiled: number; unimplemented: number; errored: number; sourceErrors: number }, o: ExecOutcome): void {
+function bumpCounter(
+  t: {
+    filed: number;
+    dropped: number;
+    securityHeld: number;
+    alreadyFiled: number;
+    unimplemented: number;
+    errored: number;
+    sourceErrors: number;
+  },
+  o: ExecOutcome,
+): void {
   switch (o.kind) {
     case "filed":
       t.filed++;
       break;
     case "dropped":
       t.dropped++;
+      break;
+    case "security-held":
+      t.securityHeld++;
       break;
     case "already-filed":
       t.alreadyFiled++;

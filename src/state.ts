@@ -36,6 +36,11 @@ export type V2SeenRow = {
   status: string;
   plan_via: string | null;
   plan_rule_name: string | null;
+  /** Latest curator action for this row: "fire" | "gh-comment" | "hold" | null. */
+  curator_decision: string | null;
+  /** PID of the most recent `oteam assign` spawn for this row (fire/drive autopilot). */
+  spawned_pid: number | null;
+  spawned_at: string | null;
   first_seen_at: string;
   last_processed_at: string;
 };
@@ -128,6 +133,24 @@ export class State {
     const hasSpawnedAt = seenCols.some(c => c.name === "spawned_at");
     if (!hasSpawnedAt) {
       this.db.exec(`ALTER TABLE seen ADD COLUMN spawned_at TEXT;`);
+    }
+
+    // Migrate: v2_seen columns for the autopilot slice. Same pattern as v0's
+    // seen-table migrations — idempotent ALTERs gated by PRAGMA table_info.
+    const v2SeenCols = this.db
+      .query<{ name: string }, []>("PRAGMA table_info(v2_seen)")
+      .all();
+    const v2HasCuratorDecision = v2SeenCols.some(c => c.name === "curator_decision");
+    if (!v2HasCuratorDecision) {
+      this.db.exec(`ALTER TABLE v2_seen ADD COLUMN curator_decision TEXT;`);
+    }
+    const v2HasSpawnedPid = v2SeenCols.some(c => c.name === "spawned_pid");
+    if (!v2HasSpawnedPid) {
+      this.db.exec(`ALTER TABLE v2_seen ADD COLUMN spawned_pid INTEGER;`);
+    }
+    const v2HasSpawnedAt = v2SeenCols.some(c => c.name === "spawned_at");
+    if (!v2HasSpawnedAt) {
+      this.db.exec(`ALTER TABLE v2_seen ADD COLUMN spawned_at TEXT;`);
     }
 
     this.cursorsPath = join(stateDir, "cursors.json");
