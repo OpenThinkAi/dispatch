@@ -11,12 +11,13 @@ import type {
   GitHubPrsSource,
   IngestRule,
   LifecycleRule,
+  LinearSource,
   SourceConfig,
 } from "./types.ts";
 import { AUTOPILOT_VALUES } from "./types.ts";
 
 const AUTOPILOT_ENUM = z.enum(AUTOPILOT_VALUES as [string, ...string[]]);
-const SOURCE_KIND_ENUM = z.enum(["github_issues", "github_prs", "folder"]);
+const SOURCE_KIND_ENUM = z.enum(["github_issues", "github_prs", "folder", "linear"]);
 const SINK_ENUM = z.enum(["vault", "security-inbox", "drop"]);
 
 const SLUG_REGEX = /^[^/]+\/[^/]+$/;
@@ -39,11 +40,19 @@ const FolderSchema = z.object({
   pattern: z.string().default("*.md"),
 });
 
+const LinearSchema = z.object({
+  name: z.string().min(1),
+  team: z.string().min(1),
+  state: z.string().optional(),
+  project: z.string().optional(),
+});
+
 const SourcesSchema = z
   .object({
     github_issues: z.array(GitHubIssuesSchema).default([]),
     github_prs: z.array(GitHubPrsSchema).default([]),
     folder: z.array(FolderSchema).default([]),
+    linear: z.array(LinearSchema).default([]),
   })
   .default({});
 
@@ -161,6 +170,7 @@ export function loadConfigV2(path: string): ConfigV2 {
     ...data.source.github_issues.map((s): GitHubIssuesSource => ({ kind: "github_issues", ...s })),
     ...data.source.github_prs.map((s): GitHubPrsSource => ({ kind: "github_prs", ...s })),
     ...data.source.folder.map((s): FolderSource => ({ kind: "folder", ...s })),
+    ...data.source.linear.map((s): LinearSource => ({ kind: "linear", ...s })),
   ];
 
   const namesSeen = new Set<string>();

@@ -5,6 +5,8 @@ import { planIngest, type IngestPlan } from "./rules.ts";
 import { pullUrlIntoVault } from "./sinks/vault.ts";
 import { archiveFolderItem, readFolder } from "./sources/folder.ts";
 import { readGitHubIssues } from "./sources/github_issues.ts";
+import { readGitHubPrs } from "./sources/github_prs.ts";
+import { readLinear } from "./sources/linear.ts";
 import { State } from "./state.ts";
 import { triageIssue } from "./triage.ts";
 import type {
@@ -65,7 +67,7 @@ async function runDryRun(
     const cursorNote = describeCursor(source, state);
     let items: Item[] | null;
     try {
-      items = readSource(source, state);
+      items = await readSource(source, state);
     } catch (e) {
       console.log(`${source.name} (${source.kind})${cursorNote}: ERROR — ${(e as Error).message}`);
       console.log();
@@ -208,7 +210,11 @@ async function runExecute(cfg: ConfigV2, state: State): Promise<number> {
   let totals = { filed: 0, dropped: 0, alreadyFiled: 0, unimplemented: 0, errored: 0, sourceErrors: 0 };
 
   for (const source of cfg.sources) {
-    if (source.kind === "github_issues") {
+    if (
+      source.kind === "github_issues" ||
+      source.kind === "github_prs" ||
+      source.kind === "linear"
+    ) {
       const seeded = state.ensureV2CursorSeeded(source.name, new Date().toISOString());
       if (seeded) {
         console.log(`${source.name} (${source.kind}): seeded cursor to now (first sight; no backfill)`);
@@ -219,7 +225,7 @@ async function runExecute(cfg: ConfigV2, state: State): Promise<number> {
 
     let items: Item[] | null;
     try {
-      items = readSource(source, state);
+      items = await readSource(source, state);
     } catch (e) {
       console.log(`${source.name} (${source.kind}): SOURCE ERROR — ${(e as Error).message}`);
       console.log();
@@ -277,16 +283,25 @@ async function runExecute(cfg: ConfigV2, state: State): Promise<number> {
           console.log(`    (archive failed: ${(e as Error).message})`);
         }
       }
-      if (source.kind === "github_issues") {
-        const updated = (item.raw as GitHubIssue).updated_at;
+      if (
+        source.kind === "github_issues" ||
+        source.kind === "github_prs" ||
+        source.kind === "linear"
+      ) {
+        const raw = item.raw as { updated_at?: string; updatedAt?: string };
+        const updated = raw.updated_at ?? raw.updatedAt;
         if (updated && updated > maxUpdatedAt) maxUpdatedAt = updated;
       }
     }
 
-    if (source.kind === "github_issues" && canAdvanceCursor && maxUpdatedAt) {
+    const cursored =
+      source.kind === "github_issues" ||
+      source.kind === "github_prs" ||
+      source.kind === "linear";
+    if (cursored && canAdvanceCursor && maxUpdatedAt) {
       state.setV2Cursor(source.name, maxUpdatedAt);
       console.log(`  cursor → ${maxUpdatedAt}`);
-    } else if (source.kind === "github_issues" && !canAdvanceCursor) {
+    } else if (cursored && !canAdvanceCursor) {
       console.log(`  cursor NOT advanced (errors or unimplemented items will retry next tick)`);
     }
     console.log();
@@ -442,7 +457,7 @@ function bumpCounter(t: { filed: number; dropped: number; alreadyFiled: number; 
   }
 }
 
-function readSource(source: SourceConfig, state: State): Item[] | null {
+async function readSource(source: SourceConfig, state: State): Promise<Item[] | null> {
   switch (source.kind) {
     case "folder":
       return readFolder(source);
@@ -450,8 +465,14 @@ function readSource(source: SourceConfig, state: State): Item[] | null {
       const since = state.getV2Cursor(source.name);
       return readGitHubIssues(source, since ? { since } : {});
     }
-    case "github_prs":
-      return null;
+    case "github_prs": {
+      const since = state.getV2Cursor(source.name);
+      return readGitHubPrs(source, since ? { since } : {});
+    }
+    case "linear": {
+      const since = state.getV2Cursor(source.name);
+      return await readLinear(source, since ? { since } : {});
+    }
   }
 }
 
@@ -460,9 +481,19 @@ function readSource(source: SourceConfig, state: State): Item[] | null {
  * dry-run output. Empty for sources without cursor semantics (folder).
  */
 function describeCursor(source: SourceConfig, state: State): string {
-  if (source.kind !== "github_issues") return "";
+  if (
+    source.kind !== "github_issues" &&
+    source.kind !== "github_prs" &&
+    source.kind !== "linear"
+  ) {
+    return "";
+  }
   const cursor = state.getV2Cursor(source.name);
-  if (!cursor) return ", cursor: none (recent open issues)";
+  if (!cursor) {
+    if (source.kind === "github_prs") return ", cursor: none (recent open PRs)";
+    if (source.kind === "linear") return ", cursor: none (recent issues)";
+    return ", cursor: none (recent open issues)";
+  }
   return `, cursor: ${cursor} (${humanAge(cursor)} ago)`;
 }
 

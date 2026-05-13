@@ -38,6 +38,21 @@ export type Config = {
   repos: RepoConfig[];
 };
 
+export type GitHubPR = {
+  url: string;
+  html_url: string;
+  number: number;
+  title: string;
+  body: string | null;
+  state: "open" | "closed";
+  draft?: boolean;
+  merged_at?: string | null;
+  labels: { name: string }[];
+  user: { login: string } | null;
+  created_at: string;
+  updated_at: string;
+};
+
 export type GitHubIssue = {
   url: string;
   html_url: string;
@@ -168,7 +183,7 @@ export type VaultTicketSummary = {
 // concrete enough to review.
 // ─────────────────────────────────────────────────────────────────────────
 
-export type SourceKind = "github_issues" | "github_prs" | "folder";
+export type SourceKind = "github_issues" | "github_prs" | "folder" | "linear";
 
 export type GitHubIssuesSource = {
   kind: "github_issues";
@@ -191,7 +206,36 @@ export type FolderSource = {
   pattern: string;
 };
 
-export type SourceConfig = GitHubIssuesSource | GitHubPrsSource | FolderSource;
+/**
+ * Linear issues source. `team` is the team key (short code like "ENG"), not
+ * the team UUID. Optional filters narrow the fetched set client-side after
+ * the GraphQL query.
+ */
+export type LinearSource = {
+  kind: "linear";
+  name: string;
+  team: string;
+  state?: string;
+  project?: string;
+};
+
+/** Raw Linear issue payload preserved in Item.raw. */
+export type LinearIssue = {
+  id: string;
+  identifier: string;
+  title: string;
+  description: string | null;
+  url: string;
+  state: { name: string };
+  labels: { nodes: { name: string }[] };
+  creator: { name: string; email: string } | null;
+  team: { key: string };
+  project: { name: string } | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type SourceConfig = GitHubIssuesSource | GitHubPrsSource | FolderSource | LinearSource;
 
 /** Conditions on `when` — keys are AND-ed, omitted keys match anything. */
 export type IngestMatch = {

@@ -71,6 +71,15 @@ path      = "~/Inbox/dispatch"
 archive   = "~/Inbox/dispatch/.processed"
 pattern   = "*.md"
 
+# Linear issues. Requires LINEAR_API_KEY in the env. `team` is the team
+# key (e.g. "ENG"), not the team UUID. Optional `state` and `project`
+# filter narrow the fetched set.
+[[source.linear]]
+name      = "linear-eng"
+team      = "ENG"
+# state   = "Todo"
+# project = "Platform"
+
 # ─────────────────────────────────────────────────────────────────
 # Ingest rules — fire once per new item, in declaration order.
 # ─────────────────────────────────────────────────────────────────
