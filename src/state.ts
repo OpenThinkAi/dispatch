@@ -71,6 +71,26 @@ export class State {
         PRIMARY KEY (slug, number, decided_at)
       );
       CREATE INDEX IF NOT EXISTS curator_decisions_recent_idx ON curator_decisions(decided_at);
+
+      -- spike/sources-and-rules: v2 state. Parallel tables so v0 code is undisturbed.
+      CREATE TABLE IF NOT EXISTS v2_seen (
+        source_name        TEXT NOT NULL,
+        external_id        TEXT NOT NULL,
+        content_hash       TEXT NOT NULL,
+        vault_ticket_id    TEXT,
+        status             TEXT NOT NULL,
+        plan_via           TEXT,
+        plan_rule_name     TEXT,
+        first_seen_at      TEXT NOT NULL,
+        last_processed_at  TEXT NOT NULL,
+        PRIMARY KEY (source_name, external_id)
+      );
+      CREATE INDEX IF NOT EXISTS v2_seen_last_idx ON v2_seen(last_processed_at);
+
+      CREATE TABLE IF NOT EXISTS v2_cursors (
+        source_name TEXT PRIMARY KEY,
+        cursor      TEXT NOT NULL
+      );
     `);
 
     // Migrate: add triage_status column if missing.
@@ -240,6 +260,43 @@ export class State {
 
   allCursors(): Record<string, string> {
     return { ...this.cursors };
+  }
+
+  // ─── v2 cursors (per source name, not per repo slug) ────────────────────
+
+  getV2Cursor(sourceName: string): string | null {
+    const row = this.db
+      .query("SELECT cursor FROM v2_cursors WHERE source_name = ?")
+      .get(sourceName) as { cursor: string } | null;
+    return row?.cursor ?? null;
+  }
+
+  setV2Cursor(sourceName: string, iso: string): void {
+    this.db.run(
+      `INSERT INTO v2_cursors (source_name, cursor) VALUES (?, ?)
+       ON CONFLICT(source_name) DO UPDATE SET cursor = excluded.cursor`,
+      [sourceName, iso],
+    );
+  }
+
+  /**
+   * On first sight of a v2 source, seed its cursor to `iso` (usually "now")
+   * so the first real poll doesn't flood the vault with the entire backlog.
+   * Returns true if seeding happened. Mirrors `ensureCursorSeeded`.
+   */
+  ensureV2CursorSeeded(sourceName: string, iso: string): boolean {
+    if (this.getV2Cursor(sourceName)) return false;
+    this.setV2Cursor(sourceName, iso);
+    return true;
+  }
+
+  allV2Cursors(): Record<string, string> {
+    const rows = this.db
+      .query("SELECT source_name, cursor FROM v2_cursors ORDER BY source_name")
+      .all() as { source_name: string; cursor: string }[];
+    const out: Record<string, string> = {};
+    for (const r of rows) out[r.source_name] = r.cursor;
+    return out;
   }
 
   close(): void {

@@ -3,6 +3,7 @@ import { loadConfigV2 } from "./config-v2.ts";
 import { planIngest, type IngestPlan } from "./rules.ts";
 import { readFolder } from "./sources/folder.ts";
 import { readGitHubIssues } from "./sources/github_issues.ts";
+import { State } from "./state.ts";
 import { triageIssue } from "./triage.ts";
 import type {
   ConfigV2,
@@ -36,6 +37,20 @@ export async function pollV2DryRun(opts: DryRunOptions): Promise<number> {
       "\n",
   );
 
+  const state = new State(cfg.defaults.state_dir);
+  try {
+    return await runDryRun(cfg, opts, state);
+  } finally {
+    state.close();
+  }
+}
+
+async function runDryRun(
+  cfg: ConfigV2,
+  opts: DryRunOptions,
+  state: State,
+): Promise<number> {
+
   let totalItems = 0;
   let totalDrops = 0;
   let totalErrors = 0;
@@ -44,21 +59,22 @@ export async function pollV2DryRun(opts: DryRunOptions): Promise<number> {
   let triageBudgetRemaining = opts.withTriage ? opts.triageLimit : 0;
 
   for (const source of cfg.sources) {
+    const cursorNote = describeCursor(source, state);
     let items: Item[] | null;
     try {
-      items = readSource(source);
+      items = readSource(source, state);
     } catch (e) {
-      console.log(`${source.name} (${source.kind}): ERROR — ${(e as Error).message}`);
+      console.log(`${source.name} (${source.kind})${cursorNote}: ERROR — ${(e as Error).message}`);
       console.log();
       totalErrors++;
       continue;
     }
     if (items === null) {
-      console.log(`${source.name} (${source.kind}): SKIPPED — no v2 reader yet`);
+      console.log(`${source.name} (${source.kind})${cursorNote}: SKIPPED — no v2 reader yet`);
       console.log();
       continue;
     }
-    console.log(`${source.name} (${source.kind}, ${items.length} item${plural(items.length)}):`);
+    console.log(`${source.name} (${source.kind}${cursorNote}, ${items.length} item${plural(items.length)}):`);
     for (let i = 0; i < items.length; i++) {
       let item = items[i];
       let triageNote = "";
@@ -157,15 +173,43 @@ export function deriveType(t: TriageResult): string | null {
   return null;
 }
 
-function readSource(source: SourceConfig): Item[] | null {
+function readSource(source: SourceConfig, state: State): Item[] | null {
   switch (source.kind) {
     case "folder":
       return readFolder(source);
-    case "github_issues":
-      return readGitHubIssues(source);
+    case "github_issues": {
+      const since = state.getV2Cursor(source.name);
+      return readGitHubIssues(source, since ? { since } : {});
+    }
     case "github_prs":
       return null;
   }
+}
+
+/**
+ * Short human-readable note describing this source's cursor state, for
+ * dry-run output. Empty for sources without cursor semantics (folder).
+ */
+function describeCursor(source: SourceConfig, state: State): string {
+  if (source.kind !== "github_issues") return "";
+  const cursor = state.getV2Cursor(source.name);
+  if (!cursor) return ", cursor: none (recent open issues)";
+  return `, cursor: ${cursor} (${humanAge(cursor)} ago)`;
+}
+
+function humanAge(iso: string): string {
+  const then = Date.parse(iso);
+  if (Number.isNaN(then)) return "?";
+  const ms = Date.now() - then;
+  if (ms < 0) return "0s";
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h`;
+  const d = Math.floor(h / 24);
+  return `${d}d`;
 }
 
 function formatPlan(plan: IngestPlan): string {
