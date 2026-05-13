@@ -159,3 +159,130 @@ export type VaultTicketSummary = {
   one_line_summary: string;
   path: string;
 };
+
+// ─────────────────────────────────────────────────────────────────────────
+// spike/sources-and-rules — sketch of the new config shape.
+//
+// Coexists with the v0 `Config` / `RepoConfig` types above during the
+// experiment. Nothing imports these yet; they exist so the schema is
+// concrete enough to review.
+// ─────────────────────────────────────────────────────────────────────────
+
+export type SourceKind = "github_issues" | "github_prs" | "folder";
+
+export type GitHubIssuesSource = {
+  kind: "github_issues";
+  name: string;
+  slug: string;
+  can_label: boolean;
+};
+
+export type GitHubPrsSource = {
+  kind: "github_prs";
+  name: string;
+  slug: string;
+};
+
+export type FolderSource = {
+  kind: "folder";
+  name: string;
+  path: string;
+  archive: string | null;
+  pattern: string;
+};
+
+export type SourceConfig = GitHubIssuesSource | GitHubPrsSource | FolderSource;
+
+/** Conditions on `when` — keys are AND-ed, omitted keys match anything. */
+export type IngestMatch = {
+  source?: string;        // source name
+  kind?: SourceKind;
+  type?: string;          // classified type from triage (e.g. "bug", "feature", "security")
+  labels?: string[];      // ALL listed labels must be present on the item
+  repo?: string;          // github sources only — owner/repo slug
+  author?: string;        // github sources only — issue/PR author login
+};
+
+export type IngestSink = "vault" | "security-inbox" | "drop";
+
+export type IngestAction = {
+  sink?: IngestSink;      // default: "vault"
+  vault?: string;
+  project?: string;
+  autopilot?: Autopilot;
+  add_labels?: string[];
+  skip?: boolean;         // matched-and-discarded (rule-level kill switch)
+};
+
+export type IngestRule = {
+  name: string;
+  when: IngestMatch;
+  do: IngestAction;
+};
+
+export type LifecycleMatch = {
+  from_state?: string;
+  to_state?: string;
+  state?: string;                // matches the current state every tick (no transition required)
+  type?: string;
+  vault?: string;
+  project?: string;
+  stuck_for_minutes?: number;    // matches when ticket has been in current state >= N min
+};
+
+export type LifecycleAction = {
+  spawn?: string;                // shell command, e.g. "oteam assign --phase qa"
+  transition?: string;           // rewrite the ticket's vault state
+  notify?: boolean;
+};
+
+export type LifecycleRule = {
+  name: string;
+  when: LifecycleMatch;
+  do: LifecycleAction;
+};
+
+/** Same shape as IngestAction; applies when no [[rule.ingest]] matches. */
+export type DefaultAction = IngestAction;
+
+/** New top-level config shape. Built by `loadConfigV2` (not yet written). */
+export type ConfigV2 = {
+  defaults: Defaults;
+  sources: SourceConfig[];
+  ingest_rules: IngestRule[];
+  lifecycle_rules: LifecycleRule[];
+  default_action: DefaultAction | null;
+};
+
+/**
+ * Normalized shape every source emits into the rule engine. The rule
+ * matcher inspects only these fields; `raw` is preserved for sinks.
+ */
+export type Item = {
+  source: { name: string; kind: SourceKind };
+  external_id: string;            // unique-per-source identifier (e.g. "myorg/repo#42" or file path)
+  url: string | null;
+  title: string;
+  body: string;
+  author: string | null;
+  repo: string | null;            // github sources only
+  labels: string[];               // source-side labels merged with triage-suggested labels
+  type: string | null;            // classified type from triage; null pre-triage
+  created_at: string;             // ISO 8601
+  raw: unknown;                   // kind-specific payload preserved for sinks
+};
+
+/**
+ * A lifecycle event — what the lifecycle matcher gets per ticket on each
+ * poll tick. `from_state` is null on first observation. `stuck_for_minutes`
+ * is computed by the runtime from state-entry timestamps.
+ */
+export type LifecycleEvent = {
+  ticket_id: string;
+  vault: string;
+  project: string | null;
+  type: string | null;
+  from_state: string | null;
+  to_state: string;
+  stuck_for_minutes: number;
+};

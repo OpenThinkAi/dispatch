@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 import { loadConfig, configPath, repoBySlug } from "./config.ts";
+import { loadConfigV2 } from "./config-v2.ts";
 import { log } from "./log.ts";
 import { fetchIssue, parseIssueRef } from "./github.ts";
 import { pollOnce, processIssue } from "./poll.ts";
@@ -23,6 +24,7 @@ Commands:
                              writes, no GH issue mutations. Run after a model upgrade,
                              oteam version bump, or \`dispatch setup --force\`.
   config validate            Parse config + cross-check vault projects; exit non-zero on failure
+                             --v2 validates the spike sources+rules schema instead (structural only)
   config path                Print resolved config path
   state show                 Print cursors, recent processed issues, recent curator decisions
   view [--views-root=PATH] [--shell=tab|app]
@@ -100,6 +102,21 @@ async function main(argv: string[]): Promise<number> {
 
     case "config": {
       if (sub === "validate") {
+        if (rest.includes("--v2")) {
+          try {
+            const cfgV2 = loadConfigV2(configPath());
+            console.log(
+              `OK (v2 structural): ${cfgV2.sources.length} sources, ` +
+                `${cfgV2.ingest_rules.length} ingest rules, ` +
+                `${cfgV2.lifecycle_rules.length} lifecycle rules` +
+                (cfgV2.default_action ? ", [default] present" : ", no [default]"),
+            );
+            return 0;
+          } catch (e) {
+            console.error((e as Error).message);
+            return 1;
+          }
+        }
         let cfg;
         try {
           cfg = loadConfig();
