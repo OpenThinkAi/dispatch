@@ -2,6 +2,7 @@ import { configPath } from "./config.ts";
 import { loadConfigV2 } from "./config-v2.ts";
 import { planIngest, type IngestPlan } from "./rules.ts";
 import { readFolder } from "./sources/folder.ts";
+import { readGitHubIssues } from "./sources/github_issues.ts";
 import type { Item, SourceConfig } from "./types.ts";
 
 /**
@@ -21,8 +22,17 @@ export async function pollV2DryRun(): Promise<number> {
 
   let totalItems = 0;
   let totalDrops = 0;
+  let totalErrors = 0;
   for (const source of cfg.sources) {
-    const items = readSource(source);
+    let items: Item[] | null;
+    try {
+      items = readSource(source);
+    } catch (e) {
+      console.log(`${source.name} (${source.kind}): ERROR — ${(e as Error).message}`);
+      console.log();
+      totalErrors++;
+      continue;
+    }
     if (items === null) {
       console.log(`${source.name} (${source.kind}): SKIPPED — no v2 reader yet`);
       console.log();
@@ -41,10 +51,11 @@ export async function pollV2DryRun(): Promise<number> {
 
   console.log(
     `[v2 dry-run] ${totalItems} item${plural(totalItems)} planned ` +
-      `(${totalDrops} would drop) across ${cfg.sources.length} ` +
-      `source${plural(cfg.sources.length)}. No state mutated.`,
+      `(${totalDrops} would drop, ${totalErrors} source error${plural(totalErrors)}) ` +
+      `across ${cfg.sources.length} source${plural(cfg.sources.length)}. ` +
+      `No state mutated.`,
   );
-  return 0;
+  return totalErrors > 0 ? 1 : 0;
 }
 
 function readSource(source: SourceConfig): Item[] | null {
@@ -52,6 +63,7 @@ function readSource(source: SourceConfig): Item[] | null {
     case "folder":
       return readFolder(source);
     case "github_issues":
+      return readGitHubIssues(source);
     case "github_prs":
       return null;
   }
