@@ -22,8 +22,10 @@ Commands:
                              sink=vault on github_issues with autopilot=off, plus sink=drop.
                              Other sinks/autopilots log UNIMPL and are not yet processed.
                              Add --dry-run for a read-only preview.
-                             Add --with-triage [--triage-limit=N] (dry-run only for now) to
-                             classify github_issues items via the triage model.
+                             Add --with-triage [--triage-limit=N] to classify github_issues
+                             items via the triage model (default limit 5); fills in item.type
+                             so type-gated rules (e.g. security routing) fire. Works in both
+                             execute and --dry-run modes.
   watch [--interval SEC]     Foreground loop calling poll (default 300s); for dev/debug
   process <url-or-ref>       Manually ingest one issue (does NOT trigger curation)
   smoketest                  Exercise every external integration (gh, oteam, Claude SDK
@@ -67,17 +69,17 @@ async function main(argv: string[]): Promise<number> {
     case "poll": {
       const args = sub ? [sub, ...rest] : rest;
       if (args.includes("--v2")) {
+        const withTriage = args.includes("--with-triage");
+        const limitArg = args.find(a => a.startsWith("--triage-limit="));
+        const triageLimit = limitArg ? Number(limitArg.split("=")[1]) : 5;
+        if (!Number.isFinite(triageLimit) || triageLimit < 0) {
+          console.error(`invalid --triage-limit value: ${limitArg}`);
+          return 2;
+        }
         if (args.includes("--dry-run")) {
-          const withTriage = args.includes("--with-triage");
-          const limitArg = args.find(a => a.startsWith("--triage-limit="));
-          const triageLimit = limitArg ? Number(limitArg.split("=")[1]) : 5;
-          if (!Number.isFinite(triageLimit) || triageLimit < 0) {
-            console.error(`invalid --triage-limit value: ${limitArg}`);
-            return 2;
-          }
           return await pollV2DryRun({ withTriage, triageLimit });
         }
-        return await pollV2Once();
+        return await pollV2Once({ withTriage, triageLimit });
       }
       const cfg = loadConfig();
       const r = await pollOnce(cfg);

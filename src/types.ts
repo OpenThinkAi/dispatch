@@ -316,6 +316,14 @@ export type Item = {
   type: string | null;            // classified type from triage; null pre-triage
   created_at: string;             // ISO 8601
   raw: unknown;                   // kind-specific payload preserved for sinks
+  /**
+   * Full triage result attached when triage ran. Distinct from `type` (which
+   * is the matcher-friendly summary) — this carries the original
+   * `security_flag` (kind + reason) and the full `labels_to_add`, useful
+   * downstream (e.g. the security-inbox sink wants the actual flag, not the
+   * abuse-default fallback).
+   */
+  triage_result?: TriageResult | null;
 };
 
 /**

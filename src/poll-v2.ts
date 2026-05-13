@@ -61,9 +61,11 @@ async function runDryRun(
   let totalItems = 0;
   let totalDrops = 0;
   let totalErrors = 0;
-  let totalTriaged = 0;
-  let totalTriageCostUsd = 0;
-  let triageBudgetRemaining = opts.withTriage ? opts.triageLimit : 0;
+  const budget = {
+    remaining: opts.withTriage ? opts.triageLimit : 0,
+    cost_usd: 0,
+    triaged: 0,
+  };
 
   for (const source of cfg.sources) {
     const cursorNote = describeCursor(source, state);
@@ -82,28 +84,10 @@ async function runDryRun(
       continue;
     }
     console.log(`${source.name} (${source.kind}${cursorNote}, ${items.length} item${plural(items.length)}):`);
-    for (let i = 0; i < items.length; i++) {
-      let item = items[i];
-      let triageNote = "";
-      if (opts.withTriage && triageable(item) && triageBudgetRemaining > 0) {
-        try {
-          const out = await triageItem(item, cfg);
-          item = out.enriched;
-          triageBudgetRemaining--;
-          totalTriaged++;
-          if (out.cost_usd !== null) totalTriageCostUsd += out.cost_usd;
-          triageNote =
-            `\n      triage: type=${out.enriched.type ?? "null"}` +
-            `  labels=[${out.enriched.labels.join(", ")}]` +
-            `  cost=$${(out.cost_usd ?? 0).toFixed(4)}`;
-        } catch (e) {
-          triageNote = `\n      triage ERROR: ${(e as Error).message}`;
-        }
-      } else if (opts.withTriage && triageable(item) && triageBudgetRemaining === 0) {
-        triageNote = "\n      triage: SKIPPED (budget exhausted)";
-      }
+    for (const original of items) {
+      const { item, note } = await maybeTriageItem(original, cfg, opts, budget);
       const plan = planIngest(item, cfg);
-      console.log(`  • "${item.title}" → ${formatPlan(plan)}${triageNote}`);
+      console.log(`  • "${item.title}" → ${formatPlan(plan)}${note}`);
       if (plan.via === "drop") totalDrops++;
     }
     if (items.length === 0) console.log("  (no items)");
@@ -112,7 +96,7 @@ async function runDryRun(
   }
 
   const triageSummary = opts.withTriage
-    ? `  ${totalTriaged} triaged ($${totalTriageCostUsd.toFixed(4)} total).`
+    ? `  ${budget.triaged} triaged ($${budget.cost_usd.toFixed(4)} total).`
     : "";
   console.log(
     `[v2 dry-run] ${totalItems} item${plural(totalItems)} planned ` +
@@ -161,8 +145,39 @@ async function triageItem(
     ...item,
     labels: mergedLabels,
     type: deriveType(out.result),
+    triage_result: out.result,
   };
   return { enriched, cost_usd: out.cost_usd, triage: out.result };
+}
+
+/**
+ * Shared budget-aware triage step for both dry-run and execute paths.
+ * Mutates `budget` in place. Returns the (possibly enriched) item plus a
+ * short note for logging.
+ */
+async function maybeTriageItem(
+  item: Item,
+  cfg: ConfigV2,
+  opts: { withTriage: boolean; triageLimit: number },
+  budget: { remaining: number; cost_usd: number; triaged: number },
+): Promise<{ item: Item; note: string }> {
+  if (!opts.withTriage || !triageable(item)) return { item, note: "" };
+  if (budget.remaining <= 0) {
+    return { item, note: "\n      triage: SKIPPED (budget exhausted)" };
+  }
+  try {
+    const out = await triageItem(item, cfg);
+    budget.remaining--;
+    budget.triaged++;
+    if (out.cost_usd !== null) budget.cost_usd += out.cost_usd;
+    const note =
+      `\n      triage: type=${out.enriched.type ?? "null"}` +
+      `  labels=[${out.enriched.labels.join(", ")}]` +
+      `  cost=$${(out.cost_usd ?? 0).toFixed(4)}`;
+    return { item: out.enriched, note };
+  } catch (e) {
+    return { item, note: `\n      triage ERROR: ${(e as Error).message}` };
+  }
 }
 
 /**
@@ -187,15 +202,22 @@ export function deriveType(t: TriageResult): string | null {
 // advance the cursor (so the next implemented slice picks it up).
 // ─────────────────────────────────────────────────────────────────────────
 
-export async function pollV2Once(): Promise<number> {
+export type ExecOptions = {
+  withTriage: boolean;
+  triageLimit: number;
+};
+
+export async function pollV2Once(opts: ExecOptions): Promise<number> {
   const cfg = loadConfigV2(configPath());
   const state = new State(cfg.defaults.state_dir);
   console.log(
     `[v2 poll] executing across ${cfg.sources.length} source${plural(cfg.sources.length)} ` +
-      `from ${cfg.defaults.config_path}\n`,
+      `from ${cfg.defaults.config_path}` +
+      (opts.withTriage ? `  (triage on, limit ${opts.triageLimit})` : "") +
+      "\n",
   );
   try {
-    return await runExecute(cfg, state);
+    return await runExecute(cfg, state, opts);
   } finally {
     state.close();
   }
@@ -209,7 +231,7 @@ type ExecOutcome =
   | { kind: "unimplemented"; reason: string }
   | { kind: "error"; error: string };
 
-async function runExecute(cfg: ConfigV2, state: State): Promise<number> {
+async function runExecute(cfg: ConfigV2, state: State, opts: ExecOptions): Promise<number> {
   let totals = {
     filed: 0,
     dropped: 0,
@@ -218,6 +240,11 @@ async function runExecute(cfg: ConfigV2, state: State): Promise<number> {
     unimplemented: 0,
     errored: 0,
     sourceErrors: 0,
+  };
+  const budget = {
+    remaining: opts.withTriage ? opts.triageLimit : 0,
+    cost_usd: 0,
+    triaged: 0,
   };
 
   for (const source of cfg.sources) {
@@ -259,7 +286,8 @@ async function runExecute(cfg: ConfigV2, state: State): Promise<number> {
     let canAdvanceCursor = true;
     let maxUpdatedAt = state.getV2Cursor(source.name) ?? "";
 
-    for (const item of items) {
+    for (const original of items) {
+      const { item, note: triageNote } = await maybeTriageItem(original, cfg, opts, budget);
       const plan = planIngest(item, cfg);
       let outcome: ExecOutcome;
       try {
@@ -276,7 +304,7 @@ async function runExecute(cfg: ConfigV2, state: State): Promise<number> {
           plan_rule_name: plan.via === "rule" ? plan.rule_name : null,
         });
       }
-      console.log(`  • "${item.title}" → ${formatPlan(plan)}   ${formatOutcome(outcome)}`);
+      console.log(`  • "${item.title}" → ${formatPlan(plan)}   ${formatOutcome(outcome)}${triageNote}`);
       bumpCounter(totals, outcome);
       if (outcome.kind === "unimplemented" || outcome.kind === "error") {
         canAdvanceCursor = false;
@@ -321,11 +349,14 @@ async function runExecute(cfg: ConfigV2, state: State): Promise<number> {
     console.log();
   }
 
+  const triageSummary = opts.withTriage
+    ? ` triaged=${budget.triaged} cost=$${budget.cost_usd.toFixed(4)}`
+    : "";
   console.log(
     `[v2 poll] filed=${totals.filed} dropped=${totals.dropped} ` +
       `security-held=${totals.securityHeld} already=${totals.alreadyFiled} ` +
       `unimpl=${totals.unimplemented} errored=${totals.errored} ` +
-      `source-errors=${totals.sourceErrors}`,
+      `source-errors=${totals.sourceErrors}${triageSummary}`,
   );
   return totals.errored > 0 || totals.sourceErrors > 0 ? 1 : 0;
 }
@@ -388,7 +419,7 @@ async function executeItem(
   if (sink === "security-inbox") {
     const held = holdItemForSecurityReview({
       item,
-      flag: null, // triage's security_flag isn't yet threaded into execute mode
+      flag: item.triage_result?.security_flag ?? null,
       stateDir: cfg.defaults.state_dir,
     });
     state.markV2Seen({
