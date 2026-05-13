@@ -50,10 +50,12 @@ const SourcesSchema = z
 const IngestMatchSchema = z
   .object({
     source: z.string().optional(),
+    source_prefix: z.string().optional(),
     kind: SOURCE_KIND_ENUM.optional(),
     type: z.string().optional(),
     labels: z.array(z.string()).optional(),
     repo: z.string().optional(),
+    repo_prefix: z.string().optional(),
     author: z.string().optional(),
   })
   .strict();

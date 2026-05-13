@@ -195,12 +195,14 @@ export type SourceConfig = GitHubIssuesSource | GitHubPrsSource | FolderSource;
 
 /** Conditions on `when` — keys are AND-ed, omitted keys match anything. */
 export type IngestMatch = {
-  source?: string;        // source name
+  source?: string;            // source name (strict equality)
+  source_prefix?: string;     // source name startsWith
   kind?: SourceKind;
-  type?: string;          // classified type from triage (e.g. "bug", "feature", "security")
-  labels?: string[];      // ALL listed labels must be present on the item
-  repo?: string;          // github sources only — owner/repo slug
-  author?: string;        // github sources only — issue/PR author login
+  type?: string;              // classified type from triage (e.g. "bug", "feature", "security")
+  labels?: string[];          // ALL listed labels must be present on the item
+  repo?: string;              // github sources only — owner/repo slug (strict equality)
+  repo_prefix?: string;       // github sources only — repo slug startsWith
+  author?: string;            // github sources only — issue/PR author login
 };
 
 export type IngestSink = "vault" | "security-inbox" | "drop";

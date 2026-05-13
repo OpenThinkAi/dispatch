@@ -28,9 +28,16 @@ export function matchIngest(item: Item, rules: IngestRule[]): IngestRule | null 
 
 function matchesIngestWhen(item: Item, when: IngestMatch): boolean {
   if (when.source !== undefined && when.source !== item.source.name) return false;
+  if (when.source_prefix !== undefined && !item.source.name.startsWith(when.source_prefix)) return false;
   if (when.kind !== undefined && when.kind !== item.source.kind) return false;
   if (when.type !== undefined && when.type !== item.type) return false;
   if (when.repo !== undefined && when.repo !== item.repo) return false;
+  if (
+    when.repo_prefix !== undefined &&
+    (item.repo === null || !item.repo.startsWith(when.repo_prefix))
+  ) {
+    return false;
+  }
   if (when.author !== undefined && when.author !== item.author) return false;
   if (when.labels !== undefined && when.labels.length > 0) {
     const itemLabels = new Set(item.labels);
