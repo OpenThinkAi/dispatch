@@ -256,6 +256,7 @@ type ExecOutcome =
   | { kind: "dropped" }
   | { kind: "security-held"; path: string }
   | { kind: "already-filed" }
+  | { kind: "needs-triage" }
   | { kind: "unimplemented"; reason: string }
   | { kind: "error"; error: string };
 
@@ -265,6 +266,7 @@ async function runExecute(cfg: ConfigV2, state: State, opts: ExecOptions): Promi
     dropped: 0,
     securityHeld: 0,
     alreadyFiled: 0,
+    needsTriage: 0,
     unimplemented: 0,
     errored: 0,
     sourceErrors: 0,
@@ -334,7 +336,11 @@ async function runExecute(cfg: ConfigV2, state: State, opts: ExecOptions): Promi
       }
       console.log(`  • "${item.title}" → ${formatPlan(plan)}   ${formatOutcome(outcome)}${triageNote}`);
       bumpCounter(totals, outcome);
-      if (outcome.kind === "unimplemented" || outcome.kind === "error") {
+      if (
+        outcome.kind === "unimplemented" ||
+        outcome.kind === "error" ||
+        outcome.kind === "needs-triage"
+      ) {
         canAdvanceCursor = false;
       }
       // Folder items are deduped by the filesystem, not a cursor. Move them
@@ -383,8 +389,8 @@ async function runExecute(cfg: ConfigV2, state: State, opts: ExecOptions): Promi
   console.log(
     `[v2 poll] filed=${totals.filed} dropped=${totals.dropped} ` +
       `security-held=${totals.securityHeld} already=${totals.alreadyFiled} ` +
-      `unimpl=${totals.unimplemented} errored=${totals.errored} ` +
-      `source-errors=${totals.sourceErrors}${triageSummary}`,
+      `needs-triage=${totals.needsTriage} unimpl=${totals.unimplemented} ` +
+      `errored=${totals.errored} source-errors=${totals.sourceErrors}${triageSummary}`,
   );
   return totals.errored > 0 || totals.sourceErrors > 0 ? 1 : 0;
 }
@@ -479,6 +485,25 @@ async function executeItem(
 
   if (!item.url) {
     return { kind: "error", error: "github_issues item has no URL to pull" };
+  }
+
+  // SECURITY GATE: github_issues bodies are externally-authored and may contain
+  // secrets, vuln disclosures, PII, or abuse. The triage step is the
+  // load-bearing filter that decides whether content can reach the vault. If
+  // triage hasn't run, refuse the vault write — don't advance the cursor, so
+  // the item retries on a tick where --with-triage is set. (Linear/folder
+  // items are user/team-authored and skip this check.)
+  if (!item.triage_result) {
+    state.markV2Seen({
+      source_name: source.name,
+      external_id: item.external_id,
+      content_hash: contentHash(item),
+      vault_ticket_id: null,
+      status: "needs-triage",
+      plan_via: plan.via,
+      plan_rule_name: plan.via === "rule" ? plan.rule_name : null,
+    });
+    return { kind: "needs-triage" };
   }
 
   const r = pullUrlIntoVault({ htmlUrl: item.url, vault: action.vault, project: action.project });
@@ -617,8 +642,8 @@ async function executeItem(
           status: "green-lit",
         });
       } else {
-        // autopilot=fire or drive — claim + spawn orchestrator
-        const issueNumber = (item.raw as { number?: number }).number ?? 0;
+        // autopilot=fire or drive — claim + spawn orchestrator. Reuses the
+        // issueNumber computed above for the gh-comment/hold branches.
         const spawn = await fireOrchestrator({
           slug: source.slug,
           number: issueNumber,
@@ -670,6 +695,14 @@ async function fireOrchestrator(args: {
         return { kind: "no-write-access" };
       case "api-error":
         return { kind: "claim-error", error: claim.error };
+      default: {
+        // Exhaustiveness check. If IssueClaim gains a new failure reason
+        // and we forget to handle it here, TypeScript catches it. Without
+        // this, control would fall through and we'd spawn the orchestrator
+        // after a failed claim — defeating the claim-before-spawn invariant.
+        const _exhaustive: never = claim;
+        return { kind: "claim-error", error: `unhandled claim outcome: ${JSON.stringify(_exhaustive)}` };
+      }
     }
   }
   const r = spawnOteamAssign(args.ticketPath, args.logDir);
@@ -734,6 +767,8 @@ function formatOutcome(o: ExecOutcome): string {
       return `SECURITY-HELD → ${o.path}`;
     case "already-filed":
       return "(already filed)";
+    case "needs-triage":
+      return "NEEDS-TRIAGE (github_issues → vault requires --with-triage)";
     case "unimplemented":
       return `UNIMPL: ${o.reason}`;
     case "error":
@@ -764,6 +799,7 @@ function bumpCounter(
     dropped: number;
     securityHeld: number;
     alreadyFiled: number;
+    needsTriage: number;
     unimplemented: number;
     errored: number;
     sourceErrors: number;
@@ -782,6 +818,9 @@ function bumpCounter(
       break;
     case "already-filed":
       t.alreadyFiled++;
+      break;
+    case "needs-triage":
+      t.needsTriage++;
       break;
     case "unimplemented":
       t.unimplemented++;

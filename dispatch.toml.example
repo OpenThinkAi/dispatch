@@ -1,5 +1,14 @@
 # dispatch.toml — copy to ~/.config/dispatch/dispatch.toml and edit.
 #
+# ⚠ SPIKE NOTICE — this file documents the v2 sources+rules schema for the
+#   experimental `dispatch poll --v2` code path. The default `dispatch poll`
+#   (no --v2) is still on the v0 schema (`[[repo]]` blocks); copying this file
+#   to ~/.config/dispatch/dispatch.toml and running plain `dispatch poll`
+#   produces a do-nothing config with no error. Until the v2 path graduates
+#   from spike, keep your v0 dispatch.toml in place and either:
+#     - put this file at a parallel path like ~/.config/dispatch/dispatch-v2.toml
+#     - point dispatch at it with `DISPATCH_CONFIG=<path> dispatch poll --v2`
+#
 # Configuration model:
 #   1. [defaults]            — global knobs (state dir, models, budgets)
 #   2. [[source.<kind>]]     — where items come from
@@ -128,6 +137,13 @@ do.autopilot   = "off"
 
 # ─────────────────────────────────────────────────────────────────
 # Lifecycle rules — fire on vault-state transitions.
+#
+# ⚠ SPIKE: lifecycle rules are SPEC-ONLY in the current spike. The
+#   [[rule.lifecycle]] blocks below parse and validate, but the engine
+#   that fires them (per-tick vault-state diffing) is the next phase.
+#   autopilot=drive's re-fire-on-state-advance also awaits this engine
+#   — until then, drive items land in state="driving" on initial fire
+#   and stay there.
 # ─────────────────────────────────────────────────────────────────
 # `when.from_state` / `when.to_state` match a transition.
 # `when.state` matches the current state on every poll tick (no transition required).
