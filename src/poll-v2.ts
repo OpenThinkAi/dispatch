@@ -28,6 +28,7 @@ import { triageIssue } from "./triage.ts";
 import type {
   ConfigV2,
   GitHubIssue,
+  GitHubPR,
   IngestAction,
   Item,
   RepoConfig,
@@ -122,8 +123,10 @@ async function runDryRun(
 }
 
 function triageable(item: Item): boolean {
-  // Folder items are user-authored; triage is a github_issues affordance for now.
-  return item.source.kind === "github_issues";
+  // Folder items are user-authored and skip triage. Triage runs on
+  // externally-authored github sources (issues and PRs both — descriptions
+  // are writable by anyone with read access on the repo).
+  return item.source.kind === "github_issues" || item.source.kind === "github_prs";
 }
 
 /**
@@ -135,10 +138,32 @@ async function triageItem(
   item: Item,
   cfg: ConfigV2,
 ): Promise<{ enriched: Item; cost_usd: number | null; triage: TriageResult }> {
-  if (item.source.kind !== "github_issues") {
+  if (item.source.kind !== "github_issues" && item.source.kind !== "github_prs") {
     throw new Error(`triage not implemented for source kind: ${item.source.kind}`);
   }
-  const issue = item.raw as GitHubIssue;
+  // The triage prompt is issue-shaped (title/body/labels/user/state/number).
+  // PRs share all of those; shape-shim a PR raw payload to GitHubIssue for
+  // the call. The pull_request marker is unused by the triage prompt itself
+  // (it's there so the type checks) and the curator never sees this payload.
+  let issue: GitHubIssue;
+  if (item.source.kind === "github_issues") {
+    issue = item.raw as GitHubIssue;
+  } else {
+    const pr = item.raw as GitHubPR;
+    issue = {
+      url: pr.url,
+      html_url: pr.html_url,
+      number: pr.number,
+      title: pr.title,
+      body: pr.body,
+      state: pr.state,
+      labels: pr.labels,
+      user: pr.user,
+      created_at: pr.created_at,
+      updated_at: pr.updated_at,
+      pull_request: {},
+    };
+  }
   const fakeRepo: RepoConfig = {
     slug: item.repo ?? "",
     vault: "",
@@ -509,9 +534,18 @@ async function executeItem(
     return { kind: "security-held", path: held.path };
   }
 
-  // sink === "vault" from here on
-  if (source.kind !== "github_issues") {
+  // sink === "vault" from here on. github_issues uses the full pipeline
+  // (triage + curator + orchestrator). github_prs files for autopilot=off
+  // only — the issue-shaped curator prompt doesn't fit code-review flows;
+  // a PR-specific curator/review-agent lane is a separate slice.
+  if (source.kind !== "github_issues" && source.kind !== "github_prs") {
     return { kind: "unimplemented", reason: `vault sink not implemented for ${source.kind} source yet` };
+  }
+  if (source.kind === "github_prs" && autopilot !== "off") {
+    return {
+      kind: "unimplemented",
+      reason: `autopilot="${autopilot}" not implemented for github_prs yet (PR-specific curator lane is a separate slice)`,
+    };
   }
   // autopilot=drive is partly implemented in this slice: initial fire works
   // the same as autopilot=fire; the re-fire-on-state-advance behavior lives
@@ -525,15 +559,15 @@ async function executeItem(
   }
 
   if (!item.url) {
-    return { kind: "error", error: "github_issues item has no URL to pull" };
+    return { kind: "error", error: `${source.kind} item has no URL to pull` };
   }
 
-  // SECURITY GATE: github_issues bodies are externally-authored and may contain
-  // secrets, vuln disclosures, PII, or abuse. The triage step is the
-  // load-bearing filter that decides whether content can reach the vault. If
-  // triage hasn't run, refuse the vault write — don't advance the cursor, so
-  // the item retries on a tick where --with-triage is set. (Linear/folder
-  // items are user/team-authored and skip this check.)
+  // SECURITY GATE: github_issues and github_prs bodies are externally-authored
+  // and may contain secrets, vuln disclosures, PII, or abuse. The triage step
+  // is the load-bearing filter that decides whether content can reach the
+  // vault. If triage hasn't run, refuse the vault write — don't advance the
+  // cursor, so the item retries on a tick where --with-triage is set.
+  // (Folder items are user-authored and skip this check.)
   if (!item.triage_result) {
     state.markV2Seen({
       source_name: source.name,
@@ -561,13 +595,13 @@ async function executeItem(
     return { kind: "error", error: r.error };
   }
 
-  // do.add_labels — apply post-file. We're already narrowed to a github_issues
-  // source here; item.raw is GitHubIssue with a required `number`. Skip when
-  // can_label=false. Failures don't fail the file outcome; the vault ticket
-  // already exists.
+  // do.add_labels — apply post-file. github_issues only: github_prs doesn't
+  // carry a can_label gate today (PR sources are read-only on the github
+  // side in this slice). Skip when can_label=false on issue sources.
+  // Failures don't fail the file outcome; the vault ticket already exists.
   let labelsAdded = 0;
   const wantLabels = action.add_labels ?? [];
-  if (wantLabels.length > 0) {
+  if (wantLabels.length > 0 && source.kind === "github_issues") {
     if (!source.can_label) {
       log.info("v2 add_labels skipped: can_label=false", {
         source: source.name,
@@ -587,6 +621,11 @@ async function executeItem(
         });
       }
     }
+  } else if (wantLabels.length > 0 && source.kind === "github_prs") {
+    log.info("v2 add_labels skipped: not yet wired for github_prs", {
+      source: source.name,
+      labels: wantLabels,
+    });
   }
 
   state.markV2Seen({
@@ -608,6 +647,13 @@ async function executeItem(
   // For "fire"/"drive" + curator-fire, fireOrchestrator claims the GH issue
   // and spawns oteam-assign; for "curate-only" + curator-fire we just record
   // green-lit. gh-comment / hold decisions are the same across all three tiers.
+  //
+  // github_prs with non-off autopilot returned unimpl earlier, so by the
+  // time we're here source must be github_issues. TypeScript can't see this
+  // through the separate early-return; cast to the narrowed type so a
+  // future refactor that breaks the invariant fails at compile time, not at
+  // runtime.
+  const issueSource = source as Extract<SourceConfig, { kind: "github_issues" }>;
   if (!r.ref) {
     return {
       kind: "filed",
@@ -630,7 +676,7 @@ async function executeItem(
     slug: item.repo ?? "",
     vault: action.vault,
     project: action.project,
-    can_label: source.can_label,
+    can_label: issueSource.can_label,
     autopilot,
   };
   const recentTickets = readRecentVaultTickets({
@@ -834,7 +880,7 @@ function formatOutcome(o: ExecOutcome): string {
     case "already-filed":
       return "(already filed)";
     case "needs-triage":
-      return "NEEDS-TRIAGE (github_issues → vault requires --with-triage)";
+      return "NEEDS-TRIAGE (vault sink for external sources requires --with-triage)";
     case "unimplemented":
       return `UNIMPL: ${o.reason}`;
     case "error":
