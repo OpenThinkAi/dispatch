@@ -17,7 +17,7 @@ import {
   spawnOteamAssign,
 } from "./sinks/curator-actions.ts";
 import { holdItemForSecurityReview } from "./sinks/security.ts";
-import { pullUrlIntoVault } from "./sinks/vault.ts";
+import { fileFolderItemToVault, pullUrlIntoVault } from "./sinks/vault.ts";
 import { findVaultTicketPath, readRecentVaultTickets } from "./vault-read.ts";
 import { archiveFolderItem, readFolder } from "./sources/folder.ts";
 import { readGitHubIssues } from "./sources/github_issues.ts";
@@ -534,17 +534,29 @@ async function executeItem(
     return { kind: "security-held", path: held.path };
   }
 
-  // sink === "vault" from here on. github_issues uses the full pipeline
-  // (triage + curator + orchestrator). github_prs files for autopilot=off
-  // only — the issue-shaped curator prompt doesn't fit code-review flows;
-  // a PR-specific curator/review-agent lane is a separate slice.
-  if (source.kind !== "github_issues" && source.kind !== "github_prs") {
+  // sink === "vault" from here on. Three source kinds file to vault today:
+  //   github_issues — full pipeline (triage + curator + orchestrator)
+  //   github_prs    — autopilot=off only (PR-specific curator lane is later)
+  //   folder        — autopilot=off only, file via `oteam ticket new` + body
+  //                   append (oteam owns the AGT-NNN allocation + frontmatter)
+  // linear → vault is the remaining unimplemented case.
+  if (
+    source.kind !== "github_issues" &&
+    source.kind !== "github_prs" &&
+    source.kind !== "folder"
+  ) {
     return { kind: "unimplemented", reason: `vault sink not implemented for ${source.kind} source yet` };
   }
   if (source.kind === "github_prs" && autopilot !== "off") {
     return {
       kind: "unimplemented",
       reason: `autopilot="${autopilot}" not implemented for github_prs yet (PR-specific curator lane is a separate slice)`,
+    };
+  }
+  if (source.kind === "folder" && autopilot !== "off") {
+    return {
+      kind: "unimplemented",
+      reason: `autopilot="${autopilot}" not implemented for folder source yet (folder-specific lane is a separate slice)`,
     };
   }
   // autopilot=drive is partly implemented in this slice: initial fire works
@@ -558,30 +570,40 @@ async function executeItem(
     };
   }
 
-  if (!item.url) {
-    return { kind: "error", error: `${source.kind} item has no URL to pull` };
-  }
-
   // SECURITY GATE: github_issues and github_prs bodies are externally-authored
   // and may contain secrets, vuln disclosures, PII, or abuse. The triage step
   // is the load-bearing filter that decides whether content can reach the
   // vault. If triage hasn't run, refuse the vault write — don't advance the
   // cursor, so the item retries on a tick where --with-triage is set.
   // (Folder items are user-authored and skip this check.)
-  if (!item.triage_result) {
-    state.markV2Seen({
-      source_name: source.name,
-      external_id: item.external_id,
-      content_hash: contentHash(item),
-      vault_ticket_id: null,
-      status: "needs-triage",
-      plan_via: plan.via,
-      plan_rule_name: plan.via === "rule" ? plan.rule_name : null,
-    });
-    return { kind: "needs-triage" };
+  if (source.kind !== "folder") {
+    if (!item.url) {
+      return { kind: "error", error: `${source.kind} item has no URL to pull` };
+    }
+    if (!item.triage_result) {
+      state.markV2Seen({
+        source_name: source.name,
+        external_id: item.external_id,
+        content_hash: contentHash(item),
+        vault_ticket_id: null,
+        status: "needs-triage",
+        plan_via: plan.via,
+        plan_rule_name: plan.via === "rule" ? plan.rule_name : null,
+      });
+      return { kind: "needs-triage" };
+    }
   }
 
-  const r = pullUrlIntoVault({ htmlUrl: item.url, vault: action.vault, project: action.project });
+  const r =
+    source.kind === "folder"
+      ? fileFolderItemToVault({
+          title: item.title,
+          body: item.body,
+          vault: action.vault,
+          project: action.project,
+          labels: action.add_labels,
+        })
+      : pullUrlIntoVault({ htmlUrl: item.url!, vault: action.vault, project: action.project });
   if (!r.ok) {
     state.markV2Seen({
       source_name: source.name,
@@ -626,6 +648,10 @@ async function executeItem(
       source: source.name,
       labels: wantLabels,
     });
+  } else if (wantLabels.length > 0 && source.kind === "folder") {
+    // Labels were already passed to `oteam ticket new --label` inside
+    // fileFolderItemToVault; surface the count in the FILED outcome line.
+    labelsAdded = wantLabels.length;
   }
 
   state.markV2Seen({
@@ -741,7 +767,7 @@ async function executeItem(
         // autopilot=fire or drive — claim + spawn orchestrator. Reuses the
         // issueNumber computed above for the gh-comment/hold branches.
         const spawn = await fireOrchestrator({
-          slug: source.slug,
+          slug: issueSource.slug,
           number: issueNumber,
           botIdentity: cfg.defaults.bot_identity,
           ticketPath,

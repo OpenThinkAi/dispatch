@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { appendFileSync, existsSync } from "node:fs";
 import type { Config, GitHubIssue, RepoConfig } from "../types.ts";
 
 function oteam(args: string[]): { ok: true; stdout: string } | { ok: false; stderr: string } {
@@ -89,4 +90,51 @@ export function pullUrlIntoVault(args: {
 function extractTicketRef(stdout: string): string | null {
   const m = stdout.match(/\b(AGT-\d+)\b/);
   return m ? m[1] : null;
+}
+
+function extractTicketPath(stdout: string): string | null {
+  // oteam emits the absolute path on the line after the AGT-NNN ref. Pick
+  // the first absolute path that ends with .md and contains the ref.
+  for (const line of stdout.split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith("/") && trimmed.endsWith(".md")) return trimmed;
+  }
+  return null;
+}
+
+/**
+ * File a folder-source item into the vault. oteam doesn't accept a body
+ * argument, so we shell out to `oteam ticket new` for the AGT-NNN allocation
+ * + frontmatter, then append the markdown body to the resulting file.
+ *
+ * The folder source's `title` becomes the ticket title; the file content
+ * becomes the ticket body. labels are passed through to oteam's --label.
+ */
+export function fileFolderItemToVault(args: {
+  title: string;
+  body: string;
+  vault: string;
+  project: string;
+  labels?: string[];
+}): { ok: true; ref: string | null; path: string | null } | { ok: false; error: string } {
+  const argv = [
+    "ticket", "new", args.title,
+    "--workspace", args.vault,
+    "--project", args.project,
+  ];
+  for (const label of args.labels ?? []) {
+    argv.push("--label", label);
+  }
+  const r = oteam(argv);
+  if (!r.ok) return { ok: false, error: r.stderr };
+  const ref = extractTicketRef(r.stdout);
+  const path = extractTicketPath(r.stdout);
+  if (path && existsSync(path) && args.body.trim().length > 0) {
+    // Separate the auto-generated frontmatter+template from the source body
+    // with a "## Source content" header so it's obvious where the user's
+    // markdown begins.
+    const block = `\n## Source content\n\n${args.body.trim()}\n`;
+    appendFileSync(path, block);
+  }
+  return { ok: true, ref, path };
 }
