@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { appendFileSync, existsSync } from "node:fs";
+import { appendFileSync } from "node:fs";
 import type { Config, GitHubIssue, RepoConfig } from "../types.ts";
 
 function oteam(args: string[]): { ok: true; stdout: string } | { ok: false; stderr: string } {
@@ -94,7 +94,8 @@ function extractTicketRef(stdout: string): string | null {
 
 function extractTicketPath(stdout: string): string | null {
   // oteam emits the absolute path on the line after the AGT-NNN ref. Pick
-  // the first absolute path that ends with .md and contains the ref.
+  // the first absolute path that ends with .md — oteam creates one ticket
+  // per invocation, so the first match is the right one.
   for (const line of stdout.split("\n")) {
     const trimmed = line.trim();
     if (trimmed.startsWith("/") && trimmed.endsWith(".md")) return trimmed;
@@ -129,12 +130,18 @@ export function fileFolderItemToVault(args: {
   if (!r.ok) return { ok: false, error: r.stderr };
   const ref = extractTicketRef(r.stdout);
   const path = extractTicketPath(r.stdout);
-  if (path && existsSync(path) && args.body.trim().length > 0) {
+  // If there's body content to write but we couldn't parse a path from oteam
+  // stdout (output format drift, regex miss), refuse the file rather than
+  // silently dropping the user's content. The vault ticket will exist but
+  // dispatch returns an error so the caller doesn't advance the cursor.
+  if (args.body.trim().length > 0) {
+    if (!path) {
+      return { ok: false, error: "oteam did not emit a parseable ticket path; body not written" };
+    }
     // Separate the auto-generated frontmatter+template from the source body
     // with a "## Source content" header so it's obvious where the user's
     // markdown begins.
-    const block = `\n## Source content\n\n${args.body.trim()}\n`;
-    appendFileSync(path, block);
+    appendFileSync(path, `\n## Source content\n\n${args.body.trim()}\n`);
   }
   return { ok: true, ref, path };
 }
