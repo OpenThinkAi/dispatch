@@ -562,12 +562,12 @@ async function executeItem(
     return { kind: "error", error: `${source.kind} item has no URL to pull` };
   }
 
-  // SECURITY GATE: github_issues bodies are externally-authored and may contain
-  // secrets, vuln disclosures, PII, or abuse. The triage step is the
-  // load-bearing filter that decides whether content can reach the vault. If
-  // triage hasn't run, refuse the vault write — don't advance the cursor, so
-  // the item retries on a tick where --with-triage is set. (Linear/folder
-  // items are user/team-authored and skip this check.)
+  // SECURITY GATE: github_issues and github_prs bodies are externally-authored
+  // and may contain secrets, vuln disclosures, PII, or abuse. The triage step
+  // is the load-bearing filter that decides whether content can reach the
+  // vault. If triage hasn't run, refuse the vault write — don't advance the
+  // cursor, so the item retries on a tick where --with-triage is set.
+  // (Folder items are user-authored and skip this check.)
   if (!item.triage_result) {
     state.markV2Seen({
       source_name: source.name,
