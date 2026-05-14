@@ -112,15 +112,31 @@ export function holdItemForSecurityReview(args: {
   return { path };
 }
 
-/** Best-effort macOS notification; silent failure on other platforms. */
+/**
+ * Best-effort macOS notification; silent failure on other platforms.
+ *
+ * Values are passed through env vars and read with osascript's `system
+ * attribute` so we don't embed user-controlled strings into AppleScript
+ * literals — AppleScript has no `\"` escape sequence, so the previous
+ * backslash-escaping `q()` helper was implementation-specific and could
+ * have been exploited if a GH issue title slug (which becomes the ticket
+ * filename surfaced here) ever contained a quote.
+ */
 function notify(args: { title: string; subtitle?: string; message: string }): void {
   if (process.platform !== "darwin") return;
-  const script = `display notification ${q(args.message)} with title ${q(args.title)}${args.subtitle ? ` subtitle ${q(args.subtitle)}` : ""}`;
-  spawnSync("osascript", ["-e", script], { stdio: "ignore" });
-}
-
-function q(s: string): string {
-  return `"${s.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+  const script =
+    `display notification (system attribute "NOTIFY_MSG") ` +
+    `with title (system attribute "NOTIFY_TITLE")` +
+    (args.subtitle ? ` subtitle (system attribute "NOTIFY_SUBTITLE")` : "");
+  spawnSync("osascript", ["-e", script], {
+    stdio: "ignore",
+    env: {
+      ...process.env,
+      NOTIFY_MSG: args.message,
+      NOTIFY_TITLE: args.title,
+      ...(args.subtitle ? { NOTIFY_SUBTITLE: args.subtitle } : {}),
+    },
+  });
 }
 
 /**

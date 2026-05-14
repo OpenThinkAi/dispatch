@@ -277,8 +277,17 @@ export type LifecycleMatch = {
 };
 
 export type LifecycleAction = {
-  spawn?: string;                // shell command, e.g. "oteam assign --phase qa"
-  transition?: string;           // rewrite the ticket's vault state
+  /**
+   * Argv string for a detached spawn. Split on whitespace only — no shell
+   * interpretation. The matched ticket's absolute path is automatically
+   * appended as the final argv element so the spawned command knows which
+   * ticket triggered the rule (mirrors `oteam assign --inline <path>`
+   * semantics). Operators wanting shell features must use a wrapper script.
+   */
+  spawn?: string;
+  /**
+   * Best-effort macOS notification. Silent no-op on other platforms.
+   */
   notify?: boolean;
 };
 

@@ -45,6 +45,16 @@ export type V2SeenRow = {
   last_processed_at: string;
 };
 
+export type V2TicketStateRow = {
+  ticket_id: string;
+  vault: string;
+  project: string | null;
+  ticket_type: string | null;
+  state: string;
+  state_entered_at: string;
+  last_seen_at: string;
+};
+
 export type CuratorDecisionRow = {
   slug: string;
   number: number;
@@ -107,6 +117,30 @@ export class State {
       CREATE TABLE IF NOT EXISTS v2_cursors (
         source_name TEXT PRIMARY KEY,
         cursor      TEXT NOT NULL
+      );
+
+      -- lifecycle engine state. v2_ticket_state snapshots each vault ticket's
+      -- frontmatter state field across ticks so we can detect transitions.
+      -- v2_lifecycle_fired records which (ticket, rule, state-entry) triples
+      -- have already had the rule fire, so the same rule doesn't run twice
+      -- on the same state entry.
+      CREATE TABLE IF NOT EXISTS v2_ticket_state (
+        ticket_id        TEXT PRIMARY KEY,
+        vault            TEXT NOT NULL,
+        project          TEXT,
+        ticket_type      TEXT,
+        state            TEXT NOT NULL,
+        state_entered_at TEXT NOT NULL,
+        last_seen_at     TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS v2_lifecycle_fired (
+        ticket_id        TEXT NOT NULL,
+        rule_name        TEXT NOT NULL,
+        state_entered_at TEXT NOT NULL,
+        fired_at         TEXT NOT NULL,
+        outcome          TEXT NOT NULL,
+        PRIMARY KEY (ticket_id, rule_name, state_entered_at)
       );
     `);
 
@@ -421,6 +455,90 @@ export class State {
     const out: Record<string, string> = {};
     for (const r of rows) out[r.source_name] = r.cursor;
     return out;
+  }
+
+  // ─── lifecycle ───────────────────────────────────────────────────────────
+
+  /**
+   * Read a ticket's last-known state snapshot. Null if we've never seen it.
+   */
+  getTicketState(ticketId: string): V2TicketStateRow | null {
+    const row = this.db
+      .query("SELECT * FROM v2_ticket_state WHERE ticket_id = ?")
+      .get(ticketId) as V2TicketStateRow | null;
+    return row ?? null;
+  }
+
+  /**
+   * Upsert a ticket's state snapshot. If the state changed from the prior
+   * snapshot, returns `transitioned=true` along with the previous state and
+   * the new state_entered_at timestamp. If unchanged, just refreshes
+   * last_seen_at.
+   */
+  upsertTicketState(args: {
+    ticket_id: string;
+    vault: string;
+    project: string | null;
+    ticket_type: string | null;
+    state: string;
+  }): { transitioned: boolean; from_state: string | null; state_entered_at: string } {
+    const now = new Date().toISOString();
+    const existing = this.getTicketState(args.ticket_id);
+    if (!existing) {
+      this.db.run(
+        `INSERT INTO v2_ticket_state
+            (ticket_id, vault, project, ticket_type, state, state_entered_at, last_seen_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [args.ticket_id, args.vault, args.project, args.ticket_type, args.state, now, now],
+      );
+      return { transitioned: false, from_state: null, state_entered_at: now };
+    }
+    if (existing.state === args.state) {
+      this.db.run(
+        `UPDATE v2_ticket_state SET last_seen_at = ? WHERE ticket_id = ?`,
+        [now, args.ticket_id],
+      );
+      return {
+        transitioned: false,
+        from_state: existing.state,
+        state_entered_at: existing.state_entered_at,
+      };
+    }
+    // State changed → reset state_entered_at.
+    this.db.run(
+      `UPDATE v2_ticket_state
+          SET vault = ?, project = ?, ticket_type = ?, state = ?,
+              state_entered_at = ?, last_seen_at = ?
+        WHERE ticket_id = ?`,
+      [args.vault, args.project, args.ticket_type, args.state, now, now, args.ticket_id],
+    );
+    return { transitioned: true, from_state: existing.state, state_entered_at: now };
+  }
+
+  /** Has this lifecycle rule already fired for (ticket, current state-entry)? */
+  lifecycleHasFired(ticketId: string, ruleName: string, stateEnteredAt: string): boolean {
+    const row = this.db
+      .query(
+        `SELECT 1 FROM v2_lifecycle_fired
+          WHERE ticket_id = ? AND rule_name = ? AND state_entered_at = ?`,
+      )
+      .get(ticketId, ruleName, stateEnteredAt);
+    return row !== null;
+  }
+
+  /** Record a lifecycle rule firing so future ticks dedup it. */
+  markLifecycleFired(args: {
+    ticket_id: string;
+    rule_name: string;
+    state_entered_at: string;
+    outcome: string;
+  }): void {
+    this.db.run(
+      `INSERT OR REPLACE INTO v2_lifecycle_fired
+          (ticket_id, rule_name, state_entered_at, fired_at, outcome)
+        VALUES (?, ?, ?, ?, ?)`,
+      [args.ticket_id, args.rule_name, args.state_entered_at, new Date().toISOString(), args.outcome],
+    );
   }
 
   close(): void {

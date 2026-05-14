@@ -141,15 +141,23 @@ do.autopilot   = "off"
 # ⚠ SPIKE: lifecycle rules are SPEC-ONLY in the current spike. The
 #   [[rule.lifecycle]] blocks below parse and validate, but the engine
 #   that fires them (per-tick vault-state diffing) is the next phase.
-#   autopilot=drive's re-fire-on-state-advance also awaits this engine
-#   — until then, drive items land in state="driving" on initial fire
-#   and stay there.
+#   autopilot=drive's re-fire-on-state-advance now lives here — drive items
+#   are filed + initially fired by the ingest path, then advance phase by
+#   phase as the role pipeline transitions vault state.
 # ─────────────────────────────────────────────────────────────────
-# `when.from_state` / `when.to_state` match a transition.
-# `when.state` matches the current state on every poll tick (no transition required).
+# `when.from_state` / `when.to_state` match a state transition.
+# `when.state`   matches the current state on every poll tick (no transition required).
 # `when.stuck_for_minutes` matches when a ticket has sat in its current state >= N minutes.
-# `do.spawn` runs a shell command (orchestrator phase advance).
-# `do.transition` rewrites the ticket's vault state.
+# `do.spawn`     runs an argv-split command (split on whitespace ONLY — no shell;
+#                use a wrapper script for pipes/redirects/quoted args). The matched
+#                ticket's absolute path is appended as the final argv element, so
+#                the spawned command always knows which ticket triggered the rule.
+# `do.notify`    fires a best-effort macOS notification.
+#
+# Vault state mutations (writing the ticket's `state:` frontmatter, moving
+# files between lifecycle folders) are owned by oteam, not dispatch. There
+# is no `do.transition` action; phase advances are expressed by spawning an
+# orchestrator command that itself updates state.
 
 [[rule.lifecycle]]
 name           = "advance-after-spike"
@@ -161,17 +169,17 @@ name           = "advance-after-implementation"
 when.to_state  = "implementation-done"
 do.spawn       = "oteam assign --phase qa"
 
+# Notify on entry to a terminal state.
 [[rule.lifecycle]]
-name           = "archive-done-tickets"
+name           = "notify-on-done"
 when.to_state  = "done"
-do.transition  = "archive"
+do.notify      = true
 
-# Quarantine anything that's been stuck for an hour into a state that
-# leaves the active set and surfaces for operator attention.
+# Notify if a ticket has been stuck in its current state for an hour.
 [[rule.lifecycle]]
-name                     = "quarantine-stuck"
+name                     = "notify-on-stuck"
 when.stuck_for_minutes   = 60
-do.transition            = "pipeline-held"
+do.notify                = true
 
 # ─────────────────────────────────────────────────────────────────
 # Default action — applied when no [[rule.ingest]] matches.

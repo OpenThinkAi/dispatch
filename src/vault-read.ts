@@ -80,6 +80,75 @@ export function readRecentVaultTickets(args: {
   return all.slice(0, args.cap).map(x => x.summary);
 }
 
+/** Compact ticket fields the lifecycle engine reads each tick. */
+export type VaultTicketFrontmatter = {
+  ticket_id: string;
+  state: string;
+  project: string | null;
+  ticket_type: string | null;
+  path: string;
+};
+
+/**
+ * Walk every ticket file in the canonical lifecycle folders of a vault and
+ * return the frontmatter fields the lifecycle engine cares about: id, state,
+ * project, type. Skips files without parseable frontmatter (treated as
+ * non-tickets). Resolves the vault via oteam config.
+ *
+ * SPIKE: the folder list mirrors oteam's workspace layout and must stay in
+ * sync with it. If oteam adds a lifecycle folder (e.g. "blocked"), tickets
+ * in it are silently invisible to lifecycle rules until this list is
+ * updated. A future refactor should source this from oteam at runtime
+ * instead of hardcoding.
+ */
+export function walkVaultTickets(vault: string): VaultTicketFrontmatter[] {
+  const vaultPath = resolveVaultPath(vault);
+  if (!vaultPath) return [];
+  const root = join(vaultPath, "tickets");
+  if (!existsSync(root)) return [];
+  const folders = ["triage", "refined", "in-progress", "qa", "done", "archive"];
+  const out: VaultTicketFrontmatter[] = [];
+  for (const folder of folders) {
+    const dir = join(root, folder);
+    if (!existsSync(dir)) continue;
+    let entries: string[];
+    try {
+      entries = readdirSync(dir);
+    } catch {
+      continue;
+    }
+    for (const name of entries) {
+      if (!name.endsWith(".md")) continue;
+      const path = join(dir, name);
+      let raw: string;
+      try {
+        raw = readFileSync(path, "utf-8");
+      } catch {
+        continue;
+      }
+      const fm = raw.match(/^---\n([\s\S]*?)\n---/);
+      if (!fm) continue;
+      const ticket_id = pickFrontmatter(fm[1], "id");
+      const state = pickFrontmatter(fm[1], "state");
+      if (!ticket_id || !state) continue;
+      out.push({
+        ticket_id,
+        state,
+        project: pickFrontmatter(fm[1], "project"),
+        ticket_type: pickFrontmatter(fm[1], "team"),
+        path,
+      });
+    }
+  }
+  return out;
+}
+
+function pickFrontmatter(fm: string, key: string): string | null {
+  const m = fm.match(new RegExp(`^${key}\\s*:\\s*(.+?)\\s*$`, "m"));
+  if (!m) return null;
+  return m[1].replace(/^["']|["']$/g, "");
+}
+
 /**
  * Locate the on-disk ticket file for a given AGT-NNN ref under the named
  * vault. Searches the canonical lifecycle folders. Returns null if oteam

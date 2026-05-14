@@ -18,6 +18,7 @@ import {
 } from "./sinks/curator-actions.ts";
 import { holdItemForSecurityReview } from "./sinks/security.ts";
 import { fileLocalItemToVault, pullUrlIntoVault } from "./sinks/vault.ts";
+import { runLifecycle } from "./lifecycle.ts";
 import { findVaultTicketPath, readRecentVaultTickets } from "./vault-read.ts";
 import { archiveFolderItem, readFolder } from "./sources/folder.ts";
 import { readGitHubIssues } from "./sources/github_issues.ts";
@@ -446,6 +447,24 @@ async function runExecute(cfg: ConfigV2, state: State, opts: ExecOptions): Promi
       console.log(`  cursor NOT advanced (errors or unimplemented items will retry next tick)`);
     }
     console.log();
+  }
+
+  // Lifecycle pass after the source loop: scan every vault referenced by
+  // any rule, snapshot ticket state, detect transitions, fire any matching
+  // [[rule.lifecycle]] rules that haven't yet fired for the current
+  // state-entry. Runs every tick regardless of whether sources had items.
+  // Lifecycle errors are operational (one ticket file moved, one spawn
+  // misconfigured) and are logged but deliberately don't trip the exit
+  // code — a single bad rule shouldn't make every poll tick exit non-zero.
+  const lifecycle = runLifecycle(cfg, state);
+  if (cfg.lifecycle_rules.length > 0) {
+    log.info("v2 lifecycle tick", {
+      scanned: lifecycle.tickets_scanned,
+      transitions: lifecycle.transitions,
+      fired: lifecycle.rules_fired,
+      skipped_dedup: lifecycle.rules_skipped_dedup,
+      errors: lifecycle.errors,
+    });
   }
 
   const triageSummary = opts.withTriage
