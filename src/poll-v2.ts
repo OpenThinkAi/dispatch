@@ -123,9 +123,9 @@ async function runDryRun(
 }
 
 function triageable(item: Item): boolean {
-  // Folder/Linear items are user/team-authored; triage runs on externally-
-  // authored github sources (issues and PRs both — descriptions are operator-
-  // accessible to anyone with read access on the repo).
+  // Folder items are user-authored and skip triage. Triage runs on
+  // externally-authored github sources (issues and PRs both — descriptions
+  // are writable by anyone with read access on the repo).
   return item.source.kind === "github_issues" || item.source.kind === "github_prs";
 }
 
@@ -142,27 +142,28 @@ async function triageItem(
     throw new Error(`triage not implemented for source kind: ${item.source.kind}`);
   }
   // The triage prompt is issue-shaped (title/body/labels/user/state/number).
-  // PRs share all of those, so we shape-shim a PR's raw payload to GitHubIssue
-  // for the call. The pull_request marker is unused by the triage prompt.
-  const issue: GitHubIssue =
-    item.source.kind === "github_issues"
-      ? (item.raw as GitHubIssue)
-      : (() => {
-          const pr = item.raw as GitHubPR;
-          return {
-            url: pr.url,
-            html_url: pr.html_url,
-            number: pr.number,
-            title: pr.title,
-            body: pr.body,
-            state: pr.state,
-            labels: pr.labels,
-            user: pr.user,
-            created_at: pr.created_at,
-            updated_at: pr.updated_at,
-            pull_request: {},
-          };
-        })();
+  // PRs share all of those; shape-shim a PR raw payload to GitHubIssue for
+  // the call. The pull_request marker is unused by the triage prompt itself
+  // (it's there so the type checks) and the curator never sees this payload.
+  let issue: GitHubIssue;
+  if (item.source.kind === "github_issues") {
+    issue = item.raw as GitHubIssue;
+  } else {
+    const pr = item.raw as GitHubPR;
+    issue = {
+      url: pr.url,
+      html_url: pr.html_url,
+      number: pr.number,
+      title: pr.title,
+      body: pr.body,
+      state: pr.state,
+      labels: pr.labels,
+      user: pr.user,
+      created_at: pr.created_at,
+      updated_at: pr.updated_at,
+      pull_request: {},
+    };
+  }
   const fakeRepo: RepoConfig = {
     slug: item.repo ?? "",
     vault: "",
@@ -558,7 +559,7 @@ async function executeItem(
   }
 
   if (!item.url) {
-    return { kind: "error", error: "github_issues item has no URL to pull" };
+    return { kind: "error", error: `${source.kind} item has no URL to pull` };
   }
 
   // SECURITY GATE: github_issues bodies are externally-authored and may contain
@@ -647,15 +648,12 @@ async function executeItem(
   // and spawns oteam-assign; for "curate-only" + curator-fire we just record
   // green-lit. gh-comment / hold decisions are the same across all three tiers.
   //
-  // github_prs with non-off autopilot returned unimpl earlier, so source is
-  // narrowed to github_issues here. TypeScript can't see that through the
-  // separate early-return; this explicit guard reflects the invariant.
-  if (source.kind !== "github_issues") {
-    return {
-      kind: "error",
-      error: `unreachable: non-issue source ${source.kind} reached curator branch`,
-    };
-  }
+  // github_prs with non-off autopilot returned unimpl earlier, so by the
+  // time we're here source must be github_issues. TypeScript can't see this
+  // through the separate early-return; cast to the narrowed type so a
+  // future refactor that breaks the invariant fails at compile time, not at
+  // runtime.
+  const issueSource = source as Extract<SourceConfig, { kind: "github_issues" }>;
   if (!r.ref) {
     return {
       kind: "filed",
@@ -678,7 +676,7 @@ async function executeItem(
     slug: item.repo ?? "",
     vault: action.vault,
     project: action.project,
-    can_label: source.can_label,
+    can_label: issueSource.can_label,
     autopilot,
   };
   const recentTickets = readRecentVaultTickets({
@@ -882,7 +880,7 @@ function formatOutcome(o: ExecOutcome): string {
     case "already-filed":
       return "(already filed)";
     case "needs-triage":
-      return "NEEDS-TRIAGE (github_issues → vault requires --with-triage)";
+      return "NEEDS-TRIAGE (vault sink for external sources requires --with-triage)";
     case "unimplemented":
       return `UNIMPL: ${o.reason}`;
     case "error":
