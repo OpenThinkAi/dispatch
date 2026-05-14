@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { log } from "../log.ts";
-import type { GitHubIssue, RepoConfig, SecurityFlag } from "../types.ts";
+import type { GitHubIssue, Item, RepoConfig, SecurityFlag } from "../types.ts";
 
 export function holdForSecurityReview(args: {
   issue: GitHubIssue;
@@ -49,6 +49,67 @@ export function holdForSecurityReview(args: {
     kind: args.flag.kind,
     inbox_path: path,
   });
+}
+
+/**
+ * v2 variant — kind-generic security hold that works for any Item shape
+ * (github_issues, github_prs, folder, linear). Synthesizes a minimal flag
+ * when called from rules that route to sink=security-inbox without triage
+ * having produced a security_flag.
+ */
+export function holdItemForSecurityReview(args: {
+  item: Item;
+  flag: SecurityFlag | null;
+  stateDir: string;
+}): { path: string } {
+  const inboxDir = join(args.stateDir, "security-inbox");
+  mkdirSync(inboxDir, { recursive: true });
+
+  const flag: SecurityFlag = args.flag ?? {
+    kind: "abuse",
+    reason: "routed by rule to security-inbox (no triage flag)",
+  };
+  const safeSource = args.item.source.name.replace(/[^A-Za-z0-9._-]/g, "_");
+  const safeExtId = args.item.external_id.replace(/[^A-Za-z0-9._-]/g, "_");
+  const filename = `${new Date().toISOString().replace(/[:.]/g, "-")}__${safeSource}__${safeExtId}.md`;
+  const path = join(inboxDir, filename);
+
+  const body = redact(args.item.body);
+  const md = [
+    `# Security hold: ${args.item.source.name} / ${args.item.external_id}`,
+    "",
+    `- **Source:** ${args.item.source.name} (${args.item.source.kind})`,
+    `- **Kind:** ${flag.kind}`,
+    `- **Reason:** ${flag.reason}`,
+    args.item.url ? `- **URL:** ${args.item.url}` : "",
+    `- **Title:** ${args.item.title}`,
+    args.item.author ? `- **Author:** ${args.item.author}` : "",
+    `- **Created:** ${args.item.created_at}`,
+    "",
+    "## Body (redacted)",
+    "",
+    "```",
+    body,
+    "```",
+    "",
+    "_This item was held back from the vault. Review manually and decide whether to file._",
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  writeFileSync(path, md);
+  notify({
+    title: `dispatch: security hold (${flag.kind})`,
+    subtitle: `${args.item.source.name}: ${args.item.external_id}`,
+    message: flag.reason.slice(0, 180),
+  });
+  log.warn("v2 security held", {
+    source: args.item.source.name,
+    external_id: args.item.external_id,
+    kind: flag.kind,
+    inbox_path: path,
+  });
+  return { path };
 }
 
 /** Best-effort macOS notification; silent failure on other platforms. */

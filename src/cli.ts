@@ -1,5 +1,7 @@
 #!/usr/bin/env bun
 import { loadConfig, configPath, repoBySlug } from "./config.ts";
+import { loadConfigV2 } from "./config-v2.ts";
+import { pollV2DryRun, pollV2Once } from "./poll-v2.ts";
 import { log } from "./log.ts";
 import { fetchIssue, parseIssueRef } from "./github.ts";
 import { pollOnce, processIssue } from "./poll.ts";
@@ -16,6 +18,19 @@ Usage:
 
 Commands:
   poll                       One-shot: ingest, curate, orchestrate
+                             --v2 executes the spike sources+rules pipeline. Implemented:
+                             sources github_issues / github_prs / folder / linear (reader);
+                             sinks vault (github_issues) / drop / security-inbox; autopilot
+                             tiers off / curate-only / fire / drive (drive's initial fire
+                             only — re-fire-on-state-advance awaits the lifecycle slice);
+                             do.add_labels for github_issues. Not yet: vault sink for
+                             github_prs/folder/linear, the lifecycle engine.
+                             Add --dry-run for a read-only preview.
+                             Add --with-triage [--triage-limit=N] to classify github_issues
+                             items via the triage model (default limit 5); fills in item.type
+                             so type-gated rules (e.g. security routing) fire. Required for
+                             github_issues→vault writes (security gate). Works in both
+                             execute and --dry-run modes.
   watch [--interval SEC]     Foreground loop calling poll (default 300s); for dev/debug
   process <url-or-ref>       Manually ingest one issue (does NOT trigger curation)
   smoketest                  Exercise every external integration (gh, oteam, Claude SDK
@@ -23,6 +38,7 @@ Commands:
                              writes, no GH issue mutations. Run after a model upgrade,
                              oteam version bump, or \`dispatch setup --force\`.
   config validate            Parse config + cross-check vault projects; exit non-zero on failure
+                             --v2 validates the spike sources+rules schema instead (structural only)
   config path                Print resolved config path
   state show                 Print cursors, recent processed issues, recent curator decisions
   view [--views-root=PATH] [--shell=tab|app]
@@ -56,6 +72,20 @@ async function main(argv: string[]): Promise<number> {
       return 0;
 
     case "poll": {
+      const args = sub ? [sub, ...rest] : rest;
+      if (args.includes("--v2")) {
+        const withTriage = args.includes("--with-triage");
+        const limitArg = args.find(a => a.startsWith("--triage-limit="));
+        const triageLimit = limitArg ? Number(limitArg.split("=")[1]) : 5;
+        if (!Number.isFinite(triageLimit) || triageLimit < 0) {
+          console.error(`invalid --triage-limit value: ${limitArg}`);
+          return 2;
+        }
+        if (args.includes("--dry-run")) {
+          return await pollV2DryRun({ withTriage, triageLimit });
+        }
+        return await pollV2Once({ withTriage, triageLimit });
+      }
       const cfg = loadConfig();
       const r = await pollOnce(cfg);
       return r.errors > 0 ? 1 : 0;
@@ -100,6 +130,21 @@ async function main(argv: string[]): Promise<number> {
 
     case "config": {
       if (sub === "validate") {
+        if (rest.includes("--v2")) {
+          try {
+            const cfgV2 = loadConfigV2(configPath());
+            console.log(
+              `OK (v2 structural): ${cfgV2.sources.length} sources, ` +
+                `${cfgV2.ingest_rules.length} ingest rules, ` +
+                `${cfgV2.lifecycle_rules.length} lifecycle rules` +
+                (cfgV2.default_action ? ", [default] present" : ", no [default]"),
+            );
+            return 0;
+          } catch (e) {
+            console.error((e as Error).message);
+            return 1;
+          }
+        }
         let cfg;
         try {
           cfg = loadConfig();

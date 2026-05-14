@@ -28,6 +28,23 @@ export type SeenRow = {
   spawned_at: string | null;
 };
 
+export type V2SeenRow = {
+  source_name: string;
+  external_id: string;
+  content_hash: string;
+  vault_ticket_id: string | null;
+  status: string;
+  plan_via: string | null;
+  plan_rule_name: string | null;
+  /** Latest curator action for this row: "fire" | "gh-comment" | "hold" | null. */
+  curator_decision: string | null;
+  /** PID of the most recent `oteam assign` spawn for this row (fire/drive autopilot). */
+  spawned_pid: number | null;
+  spawned_at: string | null;
+  first_seen_at: string;
+  last_processed_at: string;
+};
+
 export type CuratorDecisionRow = {
   slug: string;
   number: number;
@@ -71,6 +88,26 @@ export class State {
         PRIMARY KEY (slug, number, decided_at)
       );
       CREATE INDEX IF NOT EXISTS curator_decisions_recent_idx ON curator_decisions(decided_at);
+
+      -- spike/sources-and-rules: v2 state. Parallel tables so v0 code is undisturbed.
+      CREATE TABLE IF NOT EXISTS v2_seen (
+        source_name        TEXT NOT NULL,
+        external_id        TEXT NOT NULL,
+        content_hash       TEXT NOT NULL,
+        vault_ticket_id    TEXT,
+        status             TEXT NOT NULL,
+        plan_via           TEXT,
+        plan_rule_name     TEXT,
+        first_seen_at      TEXT NOT NULL,
+        last_processed_at  TEXT NOT NULL,
+        PRIMARY KEY (source_name, external_id)
+      );
+      CREATE INDEX IF NOT EXISTS v2_seen_last_idx ON v2_seen(last_processed_at);
+
+      CREATE TABLE IF NOT EXISTS v2_cursors (
+        source_name TEXT PRIMARY KEY,
+        cursor      TEXT NOT NULL
+      );
     `);
 
     // Migrate: add triage_status column if missing.
@@ -96,6 +133,24 @@ export class State {
     const hasSpawnedAt = seenCols.some(c => c.name === "spawned_at");
     if (!hasSpawnedAt) {
       this.db.exec(`ALTER TABLE seen ADD COLUMN spawned_at TEXT;`);
+    }
+
+    // Migrate: v2_seen columns for the autopilot slice. Same pattern as v0's
+    // seen-table migrations — idempotent ALTERs gated by PRAGMA table_info.
+    const v2SeenCols = this.db
+      .query<{ name: string }, []>("PRAGMA table_info(v2_seen)")
+      .all();
+    const v2HasCuratorDecision = v2SeenCols.some(c => c.name === "curator_decision");
+    if (!v2HasCuratorDecision) {
+      this.db.exec(`ALTER TABLE v2_seen ADD COLUMN curator_decision TEXT;`);
+    }
+    const v2HasSpawnedPid = v2SeenCols.some(c => c.name === "spawned_pid");
+    if (!v2HasSpawnedPid) {
+      this.db.exec(`ALTER TABLE v2_seen ADD COLUMN spawned_pid INTEGER;`);
+    }
+    const v2HasSpawnedAt = v2SeenCols.some(c => c.name === "spawned_at");
+    if (!v2HasSpawnedAt) {
+      this.db.exec(`ALTER TABLE v2_seen ADD COLUMN spawned_at TEXT;`);
     }
 
     this.cursorsPath = join(stateDir, "cursors.json");
@@ -240,6 +295,132 @@ export class State {
 
   allCursors(): Record<string, string> {
     return { ...this.cursors };
+  }
+
+  // ─── v2 seen (per (source_name, external_id)) ──────────────────────────
+
+  getV2Seen(sourceName: string, externalId: string): V2SeenRow | null {
+    const row = this.db
+      .query("SELECT * FROM v2_seen WHERE source_name = ? AND external_id = ?")
+      .get(sourceName, externalId) as V2SeenRow | null;
+    return row ?? null;
+  }
+
+  /**
+   * Insert or update a v2_seen row. `status` is the terminal outcome:
+   * "filed" | "dropped" | "skipped" | "security-held" | "error".
+   * Callers pass the planned action's `via` and `rule_name` so we can
+   * audit how the item was routed.
+   */
+  markV2Seen(args: {
+    source_name: string;
+    external_id: string;
+    content_hash: string;
+    vault_ticket_id: string | null;
+    status: string;
+    plan_via: string | null;
+    plan_rule_name: string | null;
+  }): void {
+    const now = new Date().toISOString();
+    const existing = this.getV2Seen(args.source_name, args.external_id);
+    if (existing) {
+      this.db.run(
+        `UPDATE v2_seen
+            SET content_hash = ?, vault_ticket_id = ?, status = ?,
+                plan_via = ?, plan_rule_name = ?, last_processed_at = ?
+          WHERE source_name = ? AND external_id = ?`,
+        [
+          args.content_hash,
+          args.vault_ticket_id,
+          args.status,
+          args.plan_via,
+          args.plan_rule_name,
+          now,
+          args.source_name,
+          args.external_id,
+        ],
+      );
+    } else {
+      this.db.run(
+        `INSERT INTO v2_seen
+            (source_name, external_id, content_hash, vault_ticket_id, status,
+             plan_via, plan_rule_name, first_seen_at, last_processed_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          args.source_name,
+          args.external_id,
+          args.content_hash,
+          args.vault_ticket_id,
+          args.status,
+          args.plan_via,
+          args.plan_rule_name,
+          now,
+          now,
+        ],
+      );
+    }
+  }
+
+  /**
+   * Update a v2_seen row after the curator runs (and, for autopilot=fire/drive,
+   * after the orchestrator spawn attempt): records the curator decision, new
+   * status, and optional spawned_pid in one statement. Doesn't touch
+   * content_hash, vault_ticket_id, plan_via, or plan_rule_name.
+   */
+  updateV2SeenAfterCurator(args: {
+    source_name: string;
+    external_id: string;
+    curator_decision: string;
+    status: string;
+    spawned_pid?: number | null;
+  }): void {
+    const now = new Date().toISOString();
+    const pid = args.spawned_pid ?? null;
+    const spawnedAt = pid !== null ? now : null;
+    this.db.run(
+      `UPDATE v2_seen
+          SET curator_decision = ?, status = ?, last_processed_at = ?,
+              spawned_pid = ?, spawned_at = ?
+        WHERE source_name = ? AND external_id = ?`,
+      [args.curator_decision, args.status, now, pid, spawnedAt, args.source_name, args.external_id],
+    );
+  }
+
+  // ─── v2 cursors (per source name, not per repo slug) ────────────────────
+
+  getV2Cursor(sourceName: string): string | null {
+    const row = this.db
+      .query("SELECT cursor FROM v2_cursors WHERE source_name = ?")
+      .get(sourceName) as { cursor: string } | null;
+    return row?.cursor ?? null;
+  }
+
+  setV2Cursor(sourceName: string, iso: string): void {
+    this.db.run(
+      `INSERT INTO v2_cursors (source_name, cursor) VALUES (?, ?)
+       ON CONFLICT(source_name) DO UPDATE SET cursor = excluded.cursor`,
+      [sourceName, iso],
+    );
+  }
+
+  /**
+   * On first sight of a v2 source, seed its cursor to `iso` (usually "now")
+   * so the first real poll doesn't flood the vault with the entire backlog.
+   * Returns true if seeding happened. Mirrors `ensureCursorSeeded`.
+   */
+  ensureV2CursorSeeded(sourceName: string, iso: string): boolean {
+    if (this.getV2Cursor(sourceName)) return false;
+    this.setV2Cursor(sourceName, iso);
+    return true;
+  }
+
+  allV2Cursors(): Record<string, string> {
+    const rows = this.db
+      .query("SELECT source_name, cursor FROM v2_cursors ORDER BY source_name")
+      .all() as { source_name: string; cursor: string }[];
+    const out: Record<string, string> = {};
+    for (const r of rows) out[r.source_name] = r.cursor;
+    return out;
   }
 
   close(): void {

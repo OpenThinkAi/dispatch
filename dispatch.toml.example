@@ -1,118 +1,185 @@
 # dispatch.toml — copy to ~/.config/dispatch/dispatch.toml and edit.
 #
-# Each [[repo]] block tells dispatch:
-#   - which GitHub repo to watch
-#   - which vault to file new issues into (must be registered with oteam)
-#   - which existing project gets the ticket (dispatch never auto-creates)
-#   - whether dispatch may write labels back to the GitHub issue
-#   - autopilot tier: off | curate-only | fire | drive (see below)
+# ⚠ SPIKE NOTICE — this file documents the v2 sources+rules schema for the
+#   experimental `dispatch poll --v2` code path. The default `dispatch poll`
+#   (no --v2) is still on the v0 schema (`[[repo]]` blocks); copying this file
+#   to ~/.config/dispatch/dispatch.toml and running plain `dispatch poll`
+#   produces a do-nothing config with no error. Until the v2 path graduates
+#   from spike, keep your v0 dispatch.toml in place and either:
+#     - put this file at a parallel path like ~/.config/dispatch/dispatch-v2.toml
+#     - point dispatch at it with `DISPATCH_CONFIG=<path> dispatch poll --v2`
 #
-# Tickets are filed via `oteam pull github <issue-url>`. The configured
-# vault must be registered (`oteam config vault list`) and the configured
-# project must exist (`oteam project list --vault <vault>`); otherwise
-# dispatch refuses to file. The recommended pattern is a single
-# `triage-inbox` project per vault — every repo funnels into it, and the
-# vault's role pipeline re-files into the right active work stream.
+# Configuration model:
+#   1. [defaults]            — global knobs (state dir, models, budgets)
+#   2. [[source.<kind>]]     — where items come from
+#                              (github_issues, github_prs, folder)
+#   3. [[rule.ingest]]       — one-shot match at ingest time; picks
+#                              vault / project / autopilot / sink
+#   4. [[rule.lifecycle]]    — reactive match on vault-state transitions;
+#                              re-fires orchestrator phases, transitions
+#                              states, generalizes drive-mode
+#   5. [default]             — fallback action when no ingest rule matches
 #
-#   oteam project init triage-inbox --vault <vault> --no-edit
+# Rule matching is first-match-wins in declaration order. `when` keys are
+# AND-ed; an omitted key matches anything. `do` keys are applied in the
+# matched rule's order. The `[default]` block applies if no ingest rule
+# matches; its absence means "drop the item".
 #
-# Override per-repo by setting `project = "<active-work-stream>"` if
-# you want a specific repo's issues to land directly in an active stream.
+# ─── autopilot tiers (chosen per ingest rule via do.autopilot) ───
+# off          → file the ticket and stop. Awaits human action.
+# curate-only  → also run the curator (dedupe / hold / green-light).
+#                Green-lit tickets are not auto-fired.
+# fire         → curate AND, on green-light, autonomously fire
+#                `oteam assign` ONCE — drives the first phase only.
+# drive        → like fire, but lifecycle rules keep re-firing each
+#                phase advance until the ticket reaches a terminal
+#                vault state. Most autonomous tier.
 #
-# First run on a new repo: dispatch seeds the cursor to "now" and ingests
-# nothing historical. To backfill, edit cursors.json by hand.
-#
-# ─── autopilot ───
-# off          → ingest only. Tickets sit in triage waiting for human action. (default)
-# curate-only  → also run the curator agent, which dedupes/checks the ticket and
-#                either closes the GH issue (clean dup), holds with comment, or
-#                green-lights. Green-lit tickets are NOT auto-fired in this mode.
-# fire         → curate AND, for green-lit tickets, autonomously fire `oteam assign`
-#                ONCE — drives the ticket through the FIRST role-pipeline phase
-#                (Product) and stops. Subsequent phases (spike → implementation →
-#                qa) require manual `oteam assign` invocations or `/implement-project`.
-# drive        → like fire, but dispatch keeps watching the ticket and re-fires
-#                `oteam assign` on each phase advance until the ticket reaches a
-#                terminal vault state (done / archive / blocked). End-to-end
-#                unattended pipeline progression. Most autonomous tier; reserve
-#                for repos where you trust the agent fleet to act through QA
-#                without human review at any phase boundary.
-#
-# When any repo is in fire OR drive mode, dispatch claims the GH issue (sets
-# `assignees` to `defaults.bot_identity`) before invoking `oteam assign`. Other
-# actors (humans assigning themselves in the GH UI, other dispatch instances)
-# cause the claim to fail and the ticket transitions to `lost-race` instead of
-# firing.
-#
-# Drive-mode specifics: dispatch reads the vault ticket's frontmatter `state:`
-# field on every poll tick. State advances trigger the next phase's `oteam
-# assign` spawn. A ticket that sits in the same state for more than 60 minutes
-# transitions to `pipeline-held` so it leaves the active set and surfaces as
-# needing operator attention. `done` / `archive` states map to
-# `pipeline-complete`. `blocked` maps to `pipeline-held`.
+# When a matched rule's `do.autopilot` is "fire" or "drive" and the
+# source kind is `github_issues`, dispatch claims the GH issue (sets
+# `assignees` to `defaults.bot_identity`) before invoking the orchestrator.
 
 [defaults]
 state_dir                          = "~/.local/state/dispatch"
 log_dir                            = "~/Library/Logs/dispatch"
 poll_interval_minutes              = 5
 triage_model                       = "claude-haiku-4-5-20251001"
-body_truncate_chars                = 8000
-
-# Curator + orchestrator knobs
 curator_model                      = "claude-sonnet-4-6"
+body_truncate_chars                = 8000
 per_call_max_budget_usd            = 0.50
 per_tick_max_budget_usd            = 2.00
 max_orchestrator_spawns_per_tick   = 1
 recent_vault_tickets_window_days   = 60
 recent_vault_tickets_cap           = 40
 
-# GitHub login that the curator uses to claim issues before firing the
-# orchestrator. Required when any repo has `autopilot = "fire"`. The
-# operator's own login is the simplest choice; a dedicated bot account
-# works if the operator wants to disambiguate human vs. automated claims
-# in the GH UI.
+# GitHub login the orchestrator-claim step uses for github_issues sources.
+# Required when any ingest rule sets do.autopilot = "fire" or "drive"
+# against a github_issues source.
 bot_identity                       = ""
 
 # ─────────────────────────────────────────────────────────────────
-# Examples — replace with your own repos.
+# Sources
+# ─────────────────────────────────────────────────────────────────
+# `name` is the source's identifier in rule matches (when.source = "...").
+# Sources do NOT decide where their items go — rules do that.
+
+[[source.github_issues]]
+name      = "myapp-issues"
+slug      = "myorg/my-app"
+can_label = true
+
+[[source.github_prs]]
+name      = "myapp-prs"
+slug      = "myorg/my-app"
+
+# Drop a markdown file into `path`. Dispatch ingests it and moves it
+# into `archive` (or deletes if archive is unset).
+[[source.folder]]
+name      = "inbox"
+path      = "~/Inbox/dispatch"
+archive   = "~/Inbox/dispatch/.processed"
+pattern   = "*.md"
+
+# Linear issues. Requires LINEAR_API_KEY in the env. `team` is the team
+# key (e.g. "ENG"), not the team UUID. Optional `state` and `project`
+# filter narrow the fetched set.
+[[source.linear]]
+name      = "linear-eng"
+team      = "ENG"
+# state   = "Todo"
+# project = "Platform"
+
+# ─────────────────────────────────────────────────────────────────
+# Ingest rules — fire once per new item, in declaration order.
 # ─────────────────────────────────────────────────────────────────
 
-# Default: ingest only. Curator does not run; tickets queue for you.
-[[repo]]
-slug      = "myorg/my-app"
+# Anything triage flags as security goes to the local inbox and never
+# touches the vault. Matches across ALL sources.
+[[rule.ingest]]
+name      = "security-holds-everything"
+when.type = "security"
+do.sink   = "security-inbox"
+
+# Bugs filed in the main repo get curator dedupe but no auto-fire.
+[[rule.ingest]]
+name           = "bugs-curate-only"
+when.source    = "myapp-issues"
+when.type      = "bug"
+do.vault       = "my-vault"
+do.project     = "triage-inbox"
+do.autopilot   = "curate-only"
+
+# Feature requests in the main repo land in the roadmap project.
+[[rule.ingest]]
+name           = "features-roadmap"
+when.source    = "myapp-issues"
+when.type      = "feature"
+do.vault       = "my-vault"
+do.project     = "roadmap"
+do.autopilot   = "off"
+do.add_labels  = ["from-dispatch"]
+
+# Inbound PRs auto-fire a review phase.
+[[rule.ingest]]
+name           = "pr-reviews-fire"
+when.source    = "myapp-prs"
+do.vault       = "my-vault"
+do.project     = "active-prs"
+do.autopilot   = "fire"
+
+# Notes dropped in the inbox folder become ideas. No curator, no fire.
+[[rule.ingest]]
+name           = "inbox-as-ideas"
+when.source    = "inbox"
+do.vault       = "my-vault"
+do.project     = "ideas"
+do.autopilot   = "off"
+
+# ─────────────────────────────────────────────────────────────────
+# Lifecycle rules — fire on vault-state transitions.
+#
+# ⚠ SPIKE: lifecycle rules are SPEC-ONLY in the current spike. The
+#   [[rule.lifecycle]] blocks below parse and validate, but the engine
+#   that fires them (per-tick vault-state diffing) is the next phase.
+#   autopilot=drive's re-fire-on-state-advance also awaits this engine
+#   — until then, drive items land in state="driving" on initial fire
+#   and stay there.
+# ─────────────────────────────────────────────────────────────────
+# `when.from_state` / `when.to_state` match a transition.
+# `when.state` matches the current state on every poll tick (no transition required).
+# `when.stuck_for_minutes` matches when a ticket has sat in its current state >= N minutes.
+# `do.spawn` runs a shell command (orchestrator phase advance).
+# `do.transition` rewrites the ticket's vault state.
+
+[[rule.lifecycle]]
+name           = "advance-after-spike"
+when.to_state  = "spike-done"
+do.spawn       = "oteam assign --phase implementation"
+
+[[rule.lifecycle]]
+name           = "advance-after-implementation"
+when.to_state  = "implementation-done"
+do.spawn       = "oteam assign --phase qa"
+
+[[rule.lifecycle]]
+name           = "archive-done-tickets"
+when.to_state  = "done"
+do.transition  = "archive"
+
+# Quarantine anything that's been stuck for an hour into a state that
+# leaves the active set and surfaces for operator attention.
+[[rule.lifecycle]]
+name                     = "quarantine-stuck"
+when.stuck_for_minutes   = 60
+do.transition            = "pipeline-held"
+
+# ─────────────────────────────────────────────────────────────────
+# Default action — applied when no [[rule.ingest]] matches.
+# Omit this block to drop unmatched items silently.
+# ─────────────────────────────────────────────────────────────────
+
+[default]
+sink      = "vault"
 vault     = "my-vault"
 project   = "triage-inbox"
-can_label = true
 autopilot = "off"
-
-# Curate but don't fire: agent dedupes, comments on dups, holds for human.
-# Useful for repos where you want signal extracted but not unsupervised execution.
-[[repo]]
-slug      = "anotherorg/some-lib"
-vault     = "my-vault"
-project   = "triage-inbox"
-can_label = false
-autopilot = "curate-only"
-
-# Fire-once: curator green-lights → oteam assign fires the FIRST phase
-# (Product). Stops there. Subsequent phases need a human-attended
-# orchestrator (or /implement-project) to drive forward.
-[[repo]]
-slug      = "myorg/sandbox-toy"
-vault     = "my-vault"
-project   = "triage-inbox"
-can_label = true
-autopilot = "fire"
-
-# End-to-end drive: dispatch watches phase transitions and re-fires
-# oteam assign through Product → spike → implementation → qa → archive.
-# A ticket stuck in the same state for >60min self-quarantines into
-# `pipeline-held`. Most autonomous tier — reserve for repos where the
-# agent fleet is trusted to land changes without human review at any
-# phase boundary.
-[[repo]]
-slug      = "myorg/well-isolated-repo"
-vault     = "my-vault"
-project   = "triage-inbox"
-can_label = true
-autopilot = "drive"

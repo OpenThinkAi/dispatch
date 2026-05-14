@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import type { GitHubIssue } from "./types.ts";
+import type { GitHubIssue, GitHubPR } from "./types.ts";
 
 function gh(args: string[]): { ok: true; stdout: string } | { ok: false; stderr: string } {
   const r = spawnSync("gh", args, { encoding: "utf-8" });
@@ -59,6 +59,60 @@ export function fetchIssue(ref: string): GitHubIssue {
   ]);
   if (!r.ok) throw new Error(`gh issue fetch failed for ${ref}: ${r.stderr}`);
   return JSON.parse(r.stdout);
+}
+
+/** List open PRs sorted by most recently updated, capped at `perPage`. */
+export function listOpenPrs(slug: string, perPage = 25): GitHubPR[] {
+  const r = gh([
+    "api",
+    `repos/${slug}/pulls?state=open&per_page=${perPage}&sort=updated&direction=desc`,
+    "-H", "Accept: application/vnd.github+json",
+  ]);
+  if (!r.ok) throw new Error(`gh open-prs fetch failed for ${slug}: ${r.stderr}`);
+  let arr: GitHubPR[];
+  try { arr = JSON.parse(r.stdout); } catch (e) {
+    throw new Error(`gh open-prs returned non-JSON for ${slug}: ${(e as Error).message}`);
+  }
+  return Array.isArray(arr) ? arr : [];
+}
+
+/**
+ * List PRs updated at or after `since`. The /pulls endpoint doesn't accept
+ * a `since` param, so we sort by updated desc and stop walking as soon as
+ * we cross the cursor — same pagination shape as listIssuesSince.
+ */
+export function listPrsSince(slug: string, since: string, perPage = 100): GitHubPR[] {
+  const sinceTs = Date.parse(since);
+  if (Number.isNaN(sinceTs)) throw new Error(`listPrsSince: invalid since: ${since}`);
+  const all: GitHubPR[] = [];
+  let page = 1;
+  while (true) {
+    const r = gh([
+      "api",
+      `repos/${slug}/pulls?state=all&per_page=${perPage}&page=${page}&sort=updated&direction=desc`,
+      "-H", "Accept: application/vnd.github+json",
+    ]);
+    if (!r.ok) throw new Error(`gh prs list failed for ${slug}: ${r.stderr}`);
+    let arr: GitHubPR[];
+    try { arr = JSON.parse(r.stdout); } catch (e) {
+      throw new Error(`gh prs list returned non-JSON for ${slug}: ${(e as Error).message}`);
+    }
+    if (!Array.isArray(arr) || arr.length === 0) break;
+    let crossedCursor = false;
+    for (const pr of arr) {
+      if (Date.parse(pr.updated_at) < sinceTs) {
+        crossedCursor = true;
+        break;
+      }
+      all.push(pr);
+    }
+    if (crossedCursor || arr.length < perPage) break;
+    page += 1;
+    if (page > 50) {
+      throw new Error(`gh prs list paginated past 50 pages for ${slug}; refusing to continue`);
+    }
+  }
+  return all;
 }
 
 export function parseIssueRef(ref: string): { slug: string; number: number } {

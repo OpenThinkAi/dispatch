@@ -80,6 +80,35 @@ export function readRecentVaultTickets(args: {
   return all.slice(0, args.cap).map(x => x.summary);
 }
 
+/**
+ * Locate the on-disk ticket file for a given AGT-NNN ref under the named
+ * vault. Searches the canonical lifecycle folders. Returns null if oteam
+ * isn't aware of the vault or the ticket can't be found.
+ */
+export function findVaultTicketPath(vault: string, ticketRef: string): string | null {
+  const vaultPath = resolveVaultPath(vault);
+  if (!vaultPath) return null;
+  const root = join(vaultPath, "tickets");
+  if (!existsSync(root)) return null;
+  const folders = ["triage", "refined", "in-progress", "qa", "done", "archive"];
+  for (const folder of folders) {
+    const dir = join(root, folder);
+    if (!existsSync(dir)) continue;
+    let entries: string[];
+    try {
+      entries = readdirSync(dir);
+    } catch {
+      continue;
+    }
+    for (const name of entries) {
+      if (name.startsWith(`${ticketRef}-`) && name.endsWith(".md")) {
+        return join(dir, name);
+      }
+    }
+  }
+  return null;
+}
+
 function summariseTicket(path: string, raw: string): VaultTicketSummary | null {
   const fmMatch = raw.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
   if (!fmMatch) return null;
