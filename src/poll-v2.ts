@@ -1,8 +1,15 @@
 import { createHash } from "node:crypto";
+// SPIKE: poll-v2 deliberately uses console.log for per-item display lines and
+// the per-tick summary line — these are CLI-mode rendering, not log events.
+// All operational events (source/archive/curator/add-labels failures, security
+// overrides) go through log.* per the AGENTS.md "structured JSON via log.ts"
+// rule. Broader CLI-vs-daemon split happens when v2 daemon-mode wiring lands.
+
 import { configPath } from "./config.ts";
 import { loadConfigV2 } from "./config-v2.ts";
 import { curateTicket } from "./curator.ts";
 import { addLabels, claimIssue } from "./github.ts";
+import { log } from "./log.ts";
 import { planIngest, type IngestPlan } from "./rules.ts";
 import {
   executeGhCommentDecision,
@@ -80,6 +87,11 @@ async function runDryRun(
     try {
       items = await readSource(source, state);
     } catch (e) {
+      log.warn("v2 source read failed", {
+        source: source.name,
+        kind: source.kind,
+        error: (e as Error).message,
+      });
       console.log(`${source.name} (${source.kind})${cursorNote}: ERROR — ${(e as Error).message}`);
       console.log();
       totalErrors++;
@@ -295,6 +307,11 @@ async function runExecute(cfg: ConfigV2, state: State, opts: ExecOptions): Promi
     try {
       items = await readSource(source, state);
     } catch (e) {
+      log.warn("v2 source read failed", {
+        source: source.name,
+        kind: source.kind,
+        error: (e as Error).message,
+      });
       console.log(`${source.name} (${source.kind}): SOURCE ERROR — ${(e as Error).message}`);
       console.log();
       totals.sourceErrors++;
@@ -339,7 +356,8 @@ async function runExecute(cfg: ConfigV2, state: State, opts: ExecOptions): Promi
       if (
         outcome.kind === "unimplemented" ||
         outcome.kind === "error" ||
-        outcome.kind === "needs-triage"
+        outcome.kind === "needs-triage" ||
+        (outcome.kind === "filed" && outcome.curator_error)
       ) {
         canAdvanceCursor = false;
       }
@@ -356,7 +374,11 @@ async function runExecute(cfg: ConfigV2, state: State, opts: ExecOptions): Promi
         try {
           archiveFolderItem(source, item);
         } catch (e) {
-          console.log(`    (archive failed: ${(e as Error).message})`);
+          log.warn("v2 folder archive failed", {
+            source: source.name,
+            external_id: item.external_id,
+            error: (e as Error).message,
+          });
         }
       }
       if (
@@ -436,6 +458,35 @@ async function executeItem(
 
   const sink = action.sink ?? "vault";
   const autopilot = action.autopilot ?? "off";
+
+  // SECURITY INVARIANT (defense-in-depth): if triage flagged this item, the
+  // engine routes it to security-inbox regardless of what the rule said. The
+  // rule list still expresses intent, but the invariant "security_flag never
+  // reaches the vault" is enforced here, not by rule ordering.
+  if (item.triage_result?.security_flag && sink !== "security-inbox") {
+    log.warn("v2 security flag overrides rule routing", {
+      source: source.name,
+      external_id: item.external_id,
+      flag_kind: item.triage_result.security_flag.kind,
+      rule_sink: sink,
+      rule_name: plan.via === "rule" ? plan.rule_name : null,
+    });
+    const held = holdItemForSecurityReview({
+      item,
+      flag: item.triage_result.security_flag,
+      stateDir: cfg.defaults.state_dir,
+    });
+    state.markV2Seen({
+      source_name: source.name,
+      external_id: item.external_id,
+      content_hash: contentHash(item),
+      vault_ticket_id: null,
+      status: "security-held",
+      plan_via: plan.via,
+      plan_rule_name: plan.via === "rule" ? plan.rule_name : null,
+    });
+    return { kind: "security-held", path: held.path };
+  }
 
   if (sink === "drop") {
     state.markV2Seen({
@@ -521,22 +572,29 @@ async function executeItem(
   }
 
   // do.add_labels — apply post-file. We're already narrowed to a github_issues
-  // source here. Skip when can_label=false. Failures don't fail the file;
-  // the vault ticket already exists.
+  // source here; item.raw is GitHubIssue with a required `number`. Skip when
+  // can_label=false. Failures don't fail the file outcome; the vault ticket
+  // already exists.
   let labelsAdded = 0;
   const wantLabels = action.add_labels ?? [];
   if (wantLabels.length > 0) {
     if (!source.can_label) {
-      console.log(`    (add_labels skipped: source.can_label=false on ${source.name})`);
+      log.info("v2 add_labels skipped: can_label=false", {
+        source: source.name,
+        labels: wantLabels,
+      });
     } else {
-      const issueNumber = (item.raw as { number?: number }).number;
-      if (typeof issueNumber === "number") {
-        try {
-          addLabels(source.slug, issueNumber, wantLabels);
-          labelsAdded = wantLabels.length;
-        } catch (e) {
-          console.log(`    (add_labels failed for ${source.slug}#${issueNumber}: ${(e as Error).message})`);
-        }
+      const issueNumber = (item.raw as GitHubIssue).number;
+      try {
+        addLabels(source.slug, issueNumber, wantLabels);
+        labelsAdded = wantLabels.length;
+      } catch (e) {
+        log.warn("v2 add_labels failed", {
+          slug: source.slug,
+          number: issueNumber,
+          labels: wantLabels,
+          error: (e as Error).message,
+        });
       }
     }
   }
@@ -604,7 +662,7 @@ async function executeItem(
       reasoning: out.decision.reasoning,
       cost_usd: out.cost_usd,
     };
-    const issueNumber = (item.raw as { number?: number }).number ?? 0;
+    const issueNumber = (item.raw as GitHubIssue).number;
     if (out.decision.action === "gh-comment") {
       executeGhCommentDecision({
         repo: fakeRepo,
@@ -657,6 +715,22 @@ async function executeItem(
       }
     }
   } catch (e) {
+    // Curator threw after file landed. Record a distinct status so the next
+    // tick can re-attempt the curator instead of the already-filed guard
+    // short-circuiting. The vault ticket exists; only the curator action is
+    // unfinished. The caller holds the cursor so the item is re-fetched.
+    state.updateV2SeenAfterCurator({
+      source_name: source.name,
+      external_id: item.external_id,
+      curator_decision: "",
+      status: "curator-errored",
+    });
+    log.warn("v2 curator threw after file landed", {
+      source: source.name,
+      external_id: item.external_id,
+      vault_ticket: r.ref,
+      error: (e as Error).message,
+    });
     return {
       kind: "filed",
       ticket_ref: r.ref,

@@ -54,6 +54,10 @@ function matchesIngestWhen(item: Item, when: IngestMatch): boolean {
  * same event (e.g. "advance phase" + "notify-on-advance"). The runtime
  * is responsible for deduping per (ticket, rule, state-entry).
  *
+ * SPIKE: caller (the vault-state diffing lifecycle engine) arrives in
+ * the next slice; this is pure-function pre-work so the matcher's
+ * semantics are pinned down ahead of time.
+ *
  * Returns matched rules in declaration order so action ordering is
  * deterministic.
  *
