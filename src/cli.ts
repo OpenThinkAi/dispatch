@@ -18,13 +18,18 @@ Usage:
 
 Commands:
   poll                       One-shot: ingest, curate, orchestrate
-                             --v2 executes the spike sources+rules pipeline. Today's scope:
-                             sink=vault on github_issues with autopilot=off, plus sink=drop.
-                             Other sinks/autopilots log UNIMPL and are not yet processed.
+                             --v2 executes the spike sources+rules pipeline. Implemented:
+                             sources github_issues / github_prs / folder / linear (reader);
+                             sinks vault (github_issues) / drop / security-inbox; autopilot
+                             tiers off / curate-only / fire / drive (drive's initial fire
+                             only — re-fire-on-state-advance awaits the lifecycle slice);
+                             do.add_labels for github_issues. Not yet: vault sink for
+                             github_prs/folder/linear, the lifecycle engine.
                              Add --dry-run for a read-only preview.
                              Add --with-triage [--triage-limit=N] to classify github_issues
                              items via the triage model (default limit 5); fills in item.type
-                             so type-gated rules (e.g. security routing) fire. Works in both
+                             so type-gated rules (e.g. security routing) fire. Required for
+                             github_issues→vault writes (security gate). Works in both
                              execute and --dry-run modes.
   watch [--interval SEC]     Foreground loop calling poll (default 300s); for dev/debug
   process <url-or-ref>       Manually ingest one issue (does NOT trigger curation)

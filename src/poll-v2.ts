@@ -83,7 +83,7 @@ async function runDryRun(
 
   for (const source of cfg.sources) {
     const cursorNote = describeCursor(source, state);
-    let items: Item[] | null;
+    let items: Item[];
     try {
       items = await readSource(source, state);
     } catch (e) {
@@ -95,11 +95,6 @@ async function runDryRun(
       console.log(`${source.name} (${source.kind})${cursorNote}: ERROR — ${(e as Error).message}`);
       console.log();
       totalErrors++;
-      continue;
-    }
-    if (items === null) {
-      console.log(`${source.name} (${source.kind})${cursorNote}: SKIPPED — no v2 reader yet`);
-      console.log();
       continue;
     }
     console.log(`${source.name} (${source.kind}${cursorNote}, ${items.length} item${plural(items.length)}):`);
@@ -303,7 +298,7 @@ async function runExecute(cfg: ConfigV2, state: State, opts: ExecOptions): Promi
       }
     }
 
-    let items: Item[] | null;
+    let items: Item[];
     try {
       items = await readSource(source, state);
     } catch (e) {
@@ -315,11 +310,6 @@ async function runExecute(cfg: ConfigV2, state: State, opts: ExecOptions): Promi
       console.log(`${source.name} (${source.kind}): SOURCE ERROR — ${(e as Error).message}`);
       console.log();
       totals.sourceErrors++;
-      continue;
-    }
-    if (items === null) {
-      console.log(`${source.name} (${source.kind}): SKIPPED — no v2 reader yet`);
-      console.log();
       continue;
     }
 
@@ -614,8 +604,10 @@ async function executeItem(
     return { kind: "filed", ticket_ref: r.ref, labels_added: labelsAdded };
   }
 
-  // autopilot=curate-only → run curator, apply decision. (fire/drive return
-  // unimplemented above; sub-slice D adds the orchestrator spawn.)
+  // autopilot in {curate-only, fire, drive} → run curator, apply decision.
+  // For "fire"/"drive" + curator-fire, fireOrchestrator claims the GH issue
+  // and spawns oteam-assign; for "curate-only" + curator-fire we just record
+  // green-lit. gh-comment / hold decisions are the same across all three tiers.
   if (!r.ref) {
     return {
       kind: "filed",
@@ -905,7 +897,7 @@ function bumpCounter(
   }
 }
 
-async function readSource(source: SourceConfig, state: State): Promise<Item[] | null> {
+async function readSource(source: SourceConfig, state: State): Promise<Item[]> {
   switch (source.kind) {
     case "folder":
       return readFolder(source);
