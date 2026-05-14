@@ -576,7 +576,20 @@ async function executeItem(
   // is the load-bearing filter that decides whether content can reach the
   // vault. If triage hasn't run, refuse the vault write — don't advance the
   // cursor, so the item retries on a tick where --with-triage is set.
-  // (Folder and Linear items are user/team-authored and skip this check.)
+  //
+  // Folder items skip the gate because they're authored locally by the
+  // operator — trust is direct.
+  //
+  // Linear items skip the gate under the assumption that the configured
+  // Linear workspace is internal-only (no guest seats, no public-facing
+  // integrations creating issues from external input). Operators whose
+  // Linear workspace accepts external contributions MUST run triage on
+  // Linear items via --with-triage and either extend triageable() to
+  // include "linear" or remove the linear branch from this allowlist.
+  // The security-flag override above still fires for Linear items whose
+  // body trips a triage classifier, so the "secret/PII never reaches the
+  // vault" invariant is preserved when triage is run — this bypass is
+  // only about the *requirement* to run triage at all.
   if (source.kind !== "folder" && source.kind !== "linear") {
     if (!item.url) {
       return { kind: "error", error: `${source.kind} item has no URL to pull` };
@@ -612,7 +625,7 @@ async function executeItem(
     // (e.g. "ENG-123"); url is the linear.app URL.
     const linearBody = [
       item.url ? `**Linear:** ${item.url}` : "",
-      `**Linear ID:** ${item.external_id}`,
+      item.external_id ? `**Linear ID:** ${item.external_id}` : "",
       "",
       item.body,
     ]
