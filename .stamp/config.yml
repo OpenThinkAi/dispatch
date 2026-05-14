@@ -7,7 +7,15 @@ branches:
 reviewers:
   security:
     prompt: .stamp/reviewers/security.md
+    # Default of 8 leaves no headroom for the security reviewer's typical
+    # tool-call pattern (read AGENTS.md, read diff, scan multiple call
+    # sites). Raising to 20 eliminates the intermittent error_max_turns
+    # flakes that bit us across this repo's review cycles (see closed
+    # OpenThinkAi/stamp-cli#26 for the broader pattern).
+    max_turns: 20
   standards:
     prompt: .stamp/reviewers/standards.md
+    max_turns: 20
   product:
     prompt: .stamp/reviewers/product.md
+    max_turns: 20
