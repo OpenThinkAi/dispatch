@@ -18,6 +18,7 @@ import {
 } from "./sinks/curator-actions.ts";
 import { holdItemForSecurityReview } from "./sinks/security.ts";
 import { fileLocalItemToVault, pullUrlIntoVault } from "./sinks/vault.ts";
+import { runLifecycle } from "./lifecycle.ts";
 import { findVaultTicketPath, readRecentVaultTickets } from "./vault-read.ts";
 import { archiveFolderItem, readFolder } from "./sources/folder.ts";
 import { readGitHubIssues } from "./sources/github_issues.ts";
@@ -448,6 +449,19 @@ async function runExecute(cfg: ConfigV2, state: State, opts: ExecOptions): Promi
     console.log();
   }
 
+  // Lifecycle pass after the source loop: scan every vault referenced by
+  // any rule, snapshot ticket state, detect transitions, fire any matching
+  // [[rule.lifecycle]] rules that haven't yet fired for the current
+  // state-entry. Runs every tick regardless of whether sources had items.
+  const lifecycle = runLifecycle(cfg, state);
+  if (cfg.lifecycle_rules.length > 0) {
+    console.log(
+      `[v2 lifecycle] scanned=${lifecycle.tickets_scanned} ` +
+        `transitions=${lifecycle.transitions} fired=${lifecycle.rules_fired} ` +
+        `skipped-dedup=${lifecycle.rules_skipped_dedup} errors=${lifecycle.errors}`,
+    );
+  }
+
   const triageSummary = opts.withTriage
     ? ` triaged=${budget.triaged} cost=$${budget.cost_usd.toFixed(4)}`
     : "";
@@ -457,7 +471,7 @@ async function runExecute(cfg: ConfigV2, state: State, opts: ExecOptions): Promi
       `needs-triage=${totals.needsTriage} unimpl=${totals.unimplemented} ` +
       `errored=${totals.errored} source-errors=${totals.sourceErrors}${triageSummary}`,
   );
-  return totals.errored > 0 || totals.sourceErrors > 0 ? 1 : 0;
+  return totals.errored > 0 || totals.sourceErrors > 0 || lifecycle.errors > 0 ? 1 : 0;
 }
 
 async function executeItem(
