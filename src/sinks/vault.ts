@@ -104,14 +104,17 @@ function extractTicketPath(stdout: string): string | null {
 }
 
 /**
- * File a folder-source item into the vault. oteam doesn't accept a body
- * argument, so we shell out to `oteam ticket new` for the AGT-NNN allocation
- * + frontmatter, then append the markdown body to the resulting file.
+ * File a locally-authored item (folder, linear, or any future non-URL source)
+ * into the vault. oteam doesn't accept a body argument, so we shell out to
+ * `oteam ticket new` for the AGT-NNN allocation + frontmatter, then append
+ * the caller-supplied body under a "## Source content" section.
  *
- * The folder source's `title` becomes the ticket title; the file content
- * becomes the ticket body. labels are passed through to oteam's --label.
+ * Callers are responsible for shaping the body — e.g. a Linear caller
+ * prepends a `**Linear:** <url>` backlink before the description so the
+ * link to the upstream issue is preserved in the vault ticket. Labels are
+ * passed through to oteam's `--label` and applied at ticket-creation time.
  */
-export function fileFolderItemToVault(args: {
+export function fileLocalItemToVault(args: {
   title: string;
   body: string;
   vault: string;

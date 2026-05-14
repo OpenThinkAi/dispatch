@@ -17,7 +17,7 @@ import {
   spawnOteamAssign,
 } from "./sinks/curator-actions.ts";
 import { holdItemForSecurityReview } from "./sinks/security.ts";
-import { fileFolderItemToVault, pullUrlIntoVault } from "./sinks/vault.ts";
+import { fileLocalItemToVault, pullUrlIntoVault } from "./sinks/vault.ts";
 import { findVaultTicketPath, readRecentVaultTickets } from "./vault-read.ts";
 import { archiveFolderItem, readFolder } from "./sources/folder.ts";
 import { readGitHubIssues } from "./sources/github_issues.ts";
@@ -534,19 +534,14 @@ async function executeItem(
     return { kind: "security-held", path: held.path };
   }
 
-  // sink === "vault" from here on. Three source kinds file to vault today:
+  // sink === "vault" from here on. All four source kinds now file to vault:
   //   github_issues — full pipeline (triage + curator + orchestrator)
   //   github_prs    — autopilot=off only (PR-specific curator lane is later)
   //   folder        — autopilot=off only, file via `oteam ticket new` + body
   //                   append (oteam owns the AGT-NNN allocation + frontmatter)
-  // linear → vault is the remaining unimplemented case.
-  if (
-    source.kind !== "github_issues" &&
-    source.kind !== "github_prs" &&
-    source.kind !== "folder"
-  ) {
-    return { kind: "unimplemented", reason: `vault sink not implemented for ${source.kind} source yet` };
-  }
+  //   linear        — autopilot=off only, same file-via-ticket-new path as
+  //                   folder, with a `**Linear:** <url>` backlink prepended
+  //                   to the body so the upstream issue stays linked
   if (source.kind === "github_prs" && autopilot !== "off") {
     return {
       kind: "unimplemented",
@@ -557,6 +552,12 @@ async function executeItem(
     return {
       kind: "unimplemented",
       reason: `autopilot="${autopilot}" not implemented for folder source yet (folder-specific lane is a separate slice)`,
+    };
+  }
+  if (source.kind === "linear" && autopilot !== "off") {
+    return {
+      kind: "unimplemented",
+      reason: `autopilot="${autopilot}" not implemented for linear source yet (linear-specific lane is a separate slice)`,
     };
   }
   // autopilot=drive is partly implemented in this slice: initial fire works
@@ -575,8 +576,8 @@ async function executeItem(
   // is the load-bearing filter that decides whether content can reach the
   // vault. If triage hasn't run, refuse the vault write — don't advance the
   // cursor, so the item retries on a tick where --with-triage is set.
-  // (Folder items are user-authored and skip this check.)
-  if (source.kind !== "folder") {
+  // (Folder and Linear items are user/team-authored and skip this check.)
+  if (source.kind !== "folder" && source.kind !== "linear") {
     if (!item.url) {
       return { kind: "error", error: `${source.kind} item has no URL to pull` };
     }
@@ -594,16 +595,39 @@ async function executeItem(
     }
   }
 
-  const r =
-    source.kind === "folder"
-      ? fileFolderItemToVault({
-          title: item.title,
-          body: item.body,
-          vault: action.vault,
-          project: action.project,
-          labels: action.add_labels,
-        })
-      : pullUrlIntoVault({ htmlUrl: item.url!, vault: action.vault, project: action.project });
+  let r:
+    | { ok: true; ref: string | null; path?: string | null }
+    | { ok: false; error: string };
+  if (source.kind === "folder") {
+    r = fileLocalItemToVault({
+      title: item.title,
+      body: item.body,
+      vault: action.vault,
+      project: action.project,
+      labels: action.add_labels,
+    });
+  } else if (source.kind === "linear") {
+    // For Linear, prepend a `**Linear:** <url>` backlink so the vault ticket
+    // links back to the upstream issue. external_id is the Linear identifier
+    // (e.g. "ENG-123"); url is the linear.app URL.
+    const linearBody = [
+      item.url ? `**Linear:** ${item.url}` : "",
+      `**Linear ID:** ${item.external_id}`,
+      "",
+      item.body,
+    ]
+      .filter(Boolean)
+      .join("\n");
+    r = fileLocalItemToVault({
+      title: item.title,
+      body: linearBody,
+      vault: action.vault,
+      project: action.project,
+      labels: action.add_labels,
+    });
+  } else {
+    r = pullUrlIntoVault({ htmlUrl: item.url!, vault: action.vault, project: action.project });
+  }
   if (!r.ok) {
     state.markV2Seen({
       source_name: source.name,
@@ -648,9 +672,12 @@ async function executeItem(
       source: source.name,
       labels: wantLabels,
     });
-  } else if (wantLabels.length > 0 && source.kind === "folder") {
+  } else if (
+    wantLabels.length > 0 &&
+    (source.kind === "folder" || source.kind === "linear")
+  ) {
     // Labels were already passed to `oteam ticket new --label` inside
-    // fileFolderItemToVault; surface the count in the FILED outcome line.
+    // fileLocalItemToVault; surface the count in the FILED outcome line.
     labelsAdded = wantLabels.length;
   }
 
