@@ -31,6 +31,7 @@ import type {
   GitHubPR,
   IngestAction,
   Item,
+  LinearIssue,
   RepoConfig,
   SourceConfig,
   TriageResult,
@@ -123,10 +124,15 @@ async function runDryRun(
 }
 
 function triageable(item: Item): boolean {
-  // Folder items are user-authored and skip triage. Triage runs on
-  // externally-authored github sources (issues and PRs both — descriptions
-  // are writable by anyone with read access on the repo).
-  return item.source.kind === "github_issues" || item.source.kind === "github_prs";
+  // Folder items are user-authored and skip triage. Triage runs on every
+  // non-folder source: github_issues / github_prs (externally-authored on
+  // the GH side) and linear (team-internal but the workspace can have
+  // guest seats or external integrations, so we don't trust it blanket).
+  return (
+    item.source.kind === "github_issues" ||
+    item.source.kind === "github_prs" ||
+    item.source.kind === "linear"
+  );
 }
 
 /**
@@ -138,17 +144,22 @@ async function triageItem(
   item: Item,
   cfg: ConfigV2,
 ): Promise<{ enriched: Item; cost_usd: number | null; triage: TriageResult }> {
-  if (item.source.kind !== "github_issues" && item.source.kind !== "github_prs") {
+  if (
+    item.source.kind !== "github_issues" &&
+    item.source.kind !== "github_prs" &&
+    item.source.kind !== "linear"
+  ) {
     throw new Error(`triage not implemented for source kind: ${item.source.kind}`);
   }
   // The triage prompt is issue-shaped (title/body/labels/user/state/number).
-  // PRs share all of those; shape-shim a PR raw payload to GitHubIssue for
-  // the call. The pull_request marker is unused by the triage prompt itself
-  // (it's there so the type checks) and the curator never sees this payload.
+  // PRs share that shape directly; Linear maps with light translation
+  // (state.name → "open"|"closed"; identifier → integer suffix; creator
+  // email → user.login). The pull_request marker on the PR shim is unused
+  // by the prompt itself but satisfies the GitHubIssue type.
   let issue: GitHubIssue;
   if (item.source.kind === "github_issues") {
     issue = item.raw as GitHubIssue;
-  } else {
+  } else if (item.source.kind === "github_prs") {
     const pr = item.raw as GitHubPR;
     issue = {
       url: pr.url,
@@ -162,6 +173,23 @@ async function triageItem(
       created_at: pr.created_at,
       updated_at: pr.updated_at,
       pull_request: {},
+    };
+  } else {
+    const li = item.raw as LinearIssue;
+    const closed =
+      li.state.name === "Done" || li.state.name === "Cancelled" || li.state.name === "Canceled";
+    const numMatch = li.identifier.match(/(\d+)$/);
+    issue = {
+      url: li.url,
+      html_url: li.url,
+      number: numMatch ? parseInt(numMatch[1], 10) : 0,
+      title: li.title,
+      body: li.description,
+      state: closed ? "closed" : "open",
+      labels: (li.labels.nodes ?? []).map(l => ({ name: l.name })),
+      user: li.creator ? { login: li.creator.email } : null,
+      created_at: li.createdAt,
+      updated_at: li.updatedAt,
     };
   }
   const fakeRepo: RepoConfig = {
@@ -571,26 +599,18 @@ async function executeItem(
     };
   }
 
-  // SECURITY GATE: github_issues and github_prs bodies are externally-authored
-  // and may contain secrets, vuln disclosures, PII, or abuse. The triage step
-  // is the load-bearing filter that decides whether content can reach the
-  // vault. If triage hasn't run, refuse the vault write — don't advance the
-  // cursor, so the item retries on a tick where --with-triage is set.
+  // SECURITY GATE: external-source bodies are attacker-controlled (anyone
+  // with read access on the GH repo can file an issue / PR; Linear
+  // workspaces can carry guest seats or external integrations). Triage is
+  // the load-bearing filter that decides whether content can reach the
+  // vault — without it, the security-flag classifier never fires and
+  // secret/PII content lands unscreened. So: if triage hasn't run, refuse
+  // the vault write and don't advance the cursor; the item retries on a
+  // tick where --with-triage is set.
   //
-  // Folder items skip the gate because they're authored locally by the
-  // operator — trust is direct.
-  //
-  // Linear items skip the gate under the assumption that the configured
-  // Linear workspace is internal-only (no guest seats, no public-facing
-  // integrations creating issues from external input). Operators whose
-  // Linear workspace accepts external contributions MUST run triage on
-  // Linear items via --with-triage and either extend triageable() to
-  // include "linear" or remove the linear branch from this allowlist.
-  // The security-flag override above still fires for Linear items whose
-  // body trips a triage classifier, so the "secret/PII never reaches the
-  // vault" invariant is preserved when triage is run — this bypass is
-  // only about the *requirement* to run triage at all.
-  if (source.kind !== "folder" && source.kind !== "linear") {
+  // Folder is the only source kind that bypasses this gate — folder items
+  // are authored locally by the operator on disk, so trust is direct.
+  if (source.kind !== "folder") {
     if (!item.url) {
       return { kind: "error", error: `${source.kind} item has no URL to pull` };
     }
@@ -622,15 +642,17 @@ async function executeItem(
   } else if (source.kind === "linear") {
     // For Linear, prepend a `**Linear:** <url>` backlink so the vault ticket
     // links back to the upstream issue. external_id is the Linear identifier
-    // (e.g. "ENG-123"); url is the linear.app URL.
-    const linearBody = [
+    // (e.g. "ENG-123"); url is the linear.app URL. Keep backlink assembly
+    // separate from body concatenation so the paragraph break between them
+    // survives — `.filter(Boolean)` over an interleaved array would drop the
+    // blank-line separator and the backlink would render inline with the body.
+    const backlinks = [
       item.url ? `**Linear:** ${item.url}` : "",
       item.external_id ? `**Linear ID:** ${item.external_id}` : "",
-      "",
-      item.body,
     ]
       .filter(Boolean)
       .join("\n");
+    const linearBody = backlinks ? `${backlinks}\n\n${item.body}` : item.body;
     r = fileLocalItemToVault({
       title: item.title,
       body: linearBody,
@@ -638,8 +660,16 @@ async function executeItem(
       project: action.project,
       labels: action.add_labels,
     });
-  } else {
+  } else if (source.kind === "github_issues" || source.kind === "github_prs") {
     r = pullUrlIntoVault({ htmlUrl: item.url!, vault: action.vault, project: action.project });
+  } else {
+    // Exhaustiveness: every SourceKind must be handled above. A future
+    // source kind added without a vault-file path will fail typecheck here.
+    const _exhaustive: never = source;
+    return {
+      kind: "error",
+      error: `vault sink: unhandled source kind ${(_exhaustive as { kind: string }).kind}`,
+    };
   }
   if (!r.ok) {
     state.markV2Seen({
