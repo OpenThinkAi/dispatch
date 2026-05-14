@@ -1,5 +1,4 @@
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { log } from "./log.ts";
 import { matchLifecycle } from "./rules.ts";
 import { State } from "./state.ts";
@@ -17,22 +16,25 @@ export type LifecycleTickSummary = {
 /**
  * Per-tick vault-state scan + lifecycle rule execution.
  *
- * 1. Enumerate every vault referenced by any ingest rule or [default].
+ * 1. Enumerate every vault referenced by any ingest rule, [default], or a
+ *    `when.vault` on a lifecycle rule.
  * 2. For each vault, walk tickets and snapshot frontmatter state into
  *    `v2_ticket_state`. Detect transitions vs the prior snapshot.
- * 3. For each ticket (transitioned or not), build a LifecycleEvent and
- *    match it against the configured `[[rule.lifecycle]]` rules.
+ * 3. For each ticket, build a LifecycleEvent and match it against the
+ *    configured `[[rule.lifecycle]]` rules.
  * 4. For each matched rule that hasn't fired for the current state-entry,
  *    execute the rule's action and record the firing in
  *    `v2_lifecycle_fired` so it won't fire again on the next tick.
  *
  * Actions:
- *   - `do.spawn = "<command>"`  → detached spawn, argv split on whitespace
- *     (no shell:true; complex shell forms must use a wrapper script)
- *   - `do.transition = "<new>"` → rewrite the ticket's `state:` frontmatter
- *     field (file is NOT moved between lifecycle folders; that's still on
- *     the oteam side of the workspace)
- *   - `do.notify = true`        → macOS notification (best-effort)
+ *   - `do.spawn = "<cmd>"`   → detached spawn, argv split on whitespace.
+ *     The ticket's absolute path is appended as the final argv element so
+ *     the spawned command always has its target.
+ *   - `do.notify = true`     → best-effort macOS notification.
+ *
+ * Vault state mutations live on the oteam side of the workspace — there is
+ * no `do.transition` action here. Phase advances are expressed by spawning
+ * an orchestrator command that updates state itself.
  */
 export function runLifecycle(cfg: ConfigV2, state: State): LifecycleTickSummary {
   const summary: LifecycleTickSummary = {
@@ -48,6 +50,13 @@ export function runLifecycle(cfg: ConfigV2, state: State): LifecycleTickSummary 
   }
 
   const vaults = vaultsInConfig(cfg);
+  if (vaults.length === 0) {
+    log.warn("v2 lifecycle: lifecycle rules configured but no vaults referenced anywhere", {
+      lifecycle_rules: cfg.lifecycle_rules.length,
+    });
+    return summary;
+  }
+
   for (const vault of vaults) {
     let tickets;
     try {
@@ -85,7 +94,7 @@ export function runLifecycle(cfg: ConfigV2, state: State): LifecycleTickSummary 
           summary.rules_skipped_dedup++;
           continue;
         }
-        const outcome = executeLifecycleAction(rule, t.path, cfg.defaults.log_dir);
+        const outcome = executeLifecycleAction(rule, t.path);
         state.markLifecycleFired({
           ticket_id: t.ticket_id,
           rule_name: rule.name,
@@ -113,6 +122,9 @@ function vaultsInConfig(cfg: ConfigV2): string[] {
     if (rule.do.vault) set.add(rule.do.vault);
   }
   if (cfg.default_action?.vault) set.add(cfg.default_action.vault);
+  for (const rule of cfg.lifecycle_rules) {
+    if (rule.when.vault) set.add(rule.when.vault);
+  }
   return [...set];
 }
 
@@ -125,23 +137,17 @@ function minutesSince(iso: string): number {
 }
 
 /**
- * Execute a single lifecycle rule's action against the ticket file. Returns
- * an outcome string the caller records for audit (`spawned` / `transitioned`
- * / `notified` / `error:<msg>`). Failures are non-fatal — the lifecycle scan
- * continues; the rule is still recorded as fired so we don't infinite-loop
- * on the same broken action.
+ * Execute a single lifecycle rule's action against the ticket. Returns an
+ * outcome string the caller records for audit. Failures are non-fatal — the
+ * scan continues; the rule is still recorded as fired so a broken action
+ * doesn't infinite-loop on the same state entry.
  */
-function executeLifecycleAction(rule: LifecycleRule, ticketPath: string, logDir: string): string {
+function executeLifecycleAction(rule: LifecycleRule, ticketPath: string): string {
   const action = rule.do;
   if (action.spawn) {
-    const r = spawnLifecycle(action.spawn, logDir);
-    if (!r.ok) return `error: spawn failed (${r.error})`;
+    const r = spawnLifecycle(action.spawn, ticketPath);
+    if (!r.ok) return `error: ${r.error}`;
     return `spawned pid=${r.pid}`;
-  }
-  if (action.transition) {
-    const r = transitionTicketState(ticketPath, action.transition);
-    if (!r.ok) return `error: transition failed (${r.error})`;
-    return `transitioned to ${action.transition}`;
   }
   if (action.notify) {
     notify({
@@ -154,20 +160,22 @@ function executeLifecycleAction(rule: LifecycleRule, ticketPath: string, logDir:
 }
 
 /**
- * Spawn a `do.spawn` command. argv is split on whitespace ONLY — never
- * invoked via a shell. Operators wanting shell features (pipes, redirects,
- * env-var expansion, &&) must put them in a wrapper script and reference
- * the script directly. The strict argv split prevents an operator config
- * with backticks / && / $(...) from silently introducing command injection
- * via untrusted ticket content embedded in the spawn string.
+ * Spawn a `do.spawn` command with the ticket path appended as the final
+ * argv element. argv is split on whitespace ONLY — never invoked via a
+ * shell. Operators wanting shell features (pipes, redirects, env-var
+ * expansion, &&, quoted args with spaces) must put them in a wrapper
+ * script and reference the script directly. The strict argv split
+ * prevents an operator config that ever interpolates ticket content
+ * from silently introducing command injection.
  */
 function spawnLifecycle(
   cmd: string,
-  logDir: string,
+  ticketPath: string,
 ): { ok: true; pid: number } | { ok: false; error: string } {
   const argv = cmd.trim().split(/\s+/).filter(Boolean);
   if (argv.length === 0) return { ok: false, error: "empty do.spawn command" };
   const [exe, ...args] = argv;
+  args.push(ticketPath);
   try {
     const child = spawn(exe, args, {
       detached: true,
@@ -175,35 +183,23 @@ function spawnLifecycle(
     });
     child.unref();
     if (typeof child.pid !== "number") return { ok: false, error: "no pid returned by spawn" };
-    log.info("v2 lifecycle spawn", { exe, args, pid: child.pid, log_dir: logDir });
+    log.info("v2 lifecycle spawn", { exe, args, pid: child.pid, ticket_path: ticketPath });
     return { ok: true, pid: child.pid };
   } catch (e) {
-    return { ok: false, error: (e as Error).message };
+    const err = e as NodeJS.ErrnoException;
+    if (err.code === "ENOENT") {
+      return {
+        ok: false,
+        error: `executable not found: "${exe}" (do.spawn splits on whitespace only; use a wrapper script for quoted args)`,
+      };
+    }
+    return { ok: false, error: err.message };
   }
 }
 
-/**
- * Rewrite the `state:` frontmatter field in place. Doesn't move the file
- * between lifecycle folders — that's oteam's responsibility on the workspace
- * side. If the existing file has no `state:` line this fails noisily.
- */
-function transitionTicketState(
-  ticketPath: string,
-  newState: string,
-): { ok: true } | { ok: false; error: string } {
-  if (!existsSync(ticketPath)) return { ok: false, error: `ticket file missing: ${ticketPath}` };
-  const raw = readFileSync(ticketPath, "utf-8");
-  const updated = raw.replace(/^state:\s*.+$/m, `state: ${newState}`);
-  if (updated === raw) return { ok: false, error: "no state: line found in frontmatter" };
-  writeFileSync(ticketPath, updated);
-  return { ok: true };
-}
-
-function notify(args: { title: string; subtitle?: string; message: string }): void {
+function notify(args: { title: string; message: string }): void {
   if (process.platform !== "darwin") return;
-  const script = `display notification ${q(args.message)} with title ${q(args.title)}${
-    args.subtitle ? ` subtitle ${q(args.subtitle)}` : ""
-  }`;
+  const script = `display notification ${q(args.message)} with title ${q(args.title)}`;
   spawnSync("osascript", ["-e", script], { stdio: "ignore" });
 }
 

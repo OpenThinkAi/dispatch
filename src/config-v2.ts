@@ -101,7 +101,6 @@ const LifecycleMatchSchema = z
 const LifecycleActionSchema = z
   .object({
     spawn: z.string().optional(),
-    transition: z.string().optional(),
     notify: z.boolean().optional(),
   })
   .strict();

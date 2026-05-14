@@ -142,7 +142,6 @@ export class State {
         outcome          TEXT NOT NULL,
         PRIMARY KEY (ticket_id, rule_name, state_entered_at)
       );
-      CREATE INDEX IF NOT EXISTS v2_lifecycle_fired_recent_idx ON v2_lifecycle_fired(fired_at);
     `);
 
     // Migrate: add triage_status column if missing.

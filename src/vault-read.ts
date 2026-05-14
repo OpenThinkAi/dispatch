@@ -94,6 +94,12 @@ export type VaultTicketFrontmatter = {
  * return the frontmatter fields the lifecycle engine cares about: id, state,
  * project, type. Skips files without parseable frontmatter (treated as
  * non-tickets). Resolves the vault via oteam config.
+ *
+ * SPIKE: the folder list mirrors oteam's workspace layout and must stay in
+ * sync with it. If oteam adds a lifecycle folder (e.g. "blocked"), tickets
+ * in it are silently invisible to lifecycle rules until this list is
+ * updated. A future refactor should source this from oteam at runtime
+ * instead of hardcoding.
  */
 export function walkVaultTickets(vault: string): VaultTicketFrontmatter[] {
   const vaultPath = resolveVaultPath(vault);

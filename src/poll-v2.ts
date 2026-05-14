@@ -453,13 +453,18 @@ async function runExecute(cfg: ConfigV2, state: State, opts: ExecOptions): Promi
   // any rule, snapshot ticket state, detect transitions, fire any matching
   // [[rule.lifecycle]] rules that haven't yet fired for the current
   // state-entry. Runs every tick regardless of whether sources had items.
+  // Lifecycle errors are operational (one ticket file moved, one spawn
+  // misconfigured) and are logged but deliberately don't trip the exit
+  // code — a single bad rule shouldn't make every poll tick exit non-zero.
   const lifecycle = runLifecycle(cfg, state);
   if (cfg.lifecycle_rules.length > 0) {
-    console.log(
-      `[v2 lifecycle] scanned=${lifecycle.tickets_scanned} ` +
-        `transitions=${lifecycle.transitions} fired=${lifecycle.rules_fired} ` +
-        `skipped-dedup=${lifecycle.rules_skipped_dedup} errors=${lifecycle.errors}`,
-    );
+    log.info("v2 lifecycle tick", {
+      scanned: lifecycle.tickets_scanned,
+      transitions: lifecycle.transitions,
+      fired: lifecycle.rules_fired,
+      skipped_dedup: lifecycle.rules_skipped_dedup,
+      errors: lifecycle.errors,
+    });
   }
 
   const triageSummary = opts.withTriage
@@ -471,7 +476,7 @@ async function runExecute(cfg: ConfigV2, state: State, opts: ExecOptions): Promi
       `needs-triage=${totals.needsTriage} unimpl=${totals.unimplemented} ` +
       `errored=${totals.errored} source-errors=${totals.sourceErrors}${triageSummary}`,
   );
-  return totals.errored > 0 || totals.sourceErrors > 0 || lifecycle.errors > 0 ? 1 : 0;
+  return totals.errored > 0 || totals.sourceErrors > 0 ? 1 : 0;
 }
 
 async function executeItem(
