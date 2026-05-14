@@ -197,12 +197,20 @@ function spawnLifecycle(
   }
 }
 
+/**
+ * Best-effort macOS notification. Values are passed via env vars and read
+ * with osascript's `system attribute` so we never embed user-controlled
+ * strings into AppleScript literals — AppleScript has no `\"` escape, so
+ * any `q()`-style backslash escaping is implementation-specific and would
+ * be exploitable if a ticket filename ever contained a quote.
+ */
 function notify(args: { title: string; message: string }): void {
   if (process.platform !== "darwin") return;
-  const script = `display notification ${q(args.message)} with title ${q(args.title)}`;
-  spawnSync("osascript", ["-e", script], { stdio: "ignore" });
-}
-
-function q(s: string): string {
-  return `"${s.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+  const script =
+    `display notification (system attribute "NOTIFY_MSG") ` +
+    `with title (system attribute "NOTIFY_TITLE")`;
+  spawnSync("osascript", ["-e", script], {
+    stdio: "ignore",
+    env: { ...process.env, NOTIFY_MSG: args.message, NOTIFY_TITLE: args.title },
+  });
 }
