@@ -1046,14 +1046,22 @@ async function runPrReviewLane(args: {
   // on the PR's title+body via the issue API payload — diff content is
   // fetched in a secondary call and never sees the gate. If the local
   // regex detector flags a token or private key, refuse to send the diff;
-  // the ticket is still filed but the verdict step is skipped and the
-  // operator is expected to triage by hand.
+  // the ticket is still filed but the verdict step is skipped. Record
+  // the refusal in v2_seen so it's visible in audit and so subsequent
+  // ticks know the refusal already happened (cursor still advances —
+  // this is a content-based PERMANENT gate, not a transient failure).
   const scan = diffLikelyContainsSecrets(diff);
   if (scan.found) {
     log.warn("v2 review-agent refused: diff secret-scan tripped", {
       slug: args.source.slug,
       number: pr.number,
       reason: scan.reason,
+    });
+    args.state.updateV2SeenAfterCurator({
+      source_name: args.source.name,
+      external_id: args.item.external_id,
+      curator_decision: "review:refused-secret-scan",
+      status: "review-refused-secret-scan",
     });
     return {
       kind: "filed",
@@ -1117,6 +1125,12 @@ async function runPrReviewLane(args: {
       slug: args.source.slug,
       number: pr.number,
       error: (e as Error).message,
+    });
+    args.state.updateV2SeenAfterCurator({
+      source_name: args.source.name,
+      external_id: args.item.external_id,
+      curator_decision: "review:sdk-error",
+      status: "review-errored",
     });
     return {
       kind: "filed",
