@@ -322,6 +322,15 @@ type ReviewActionOutcome = {
   posted: boolean;
 };
 
+/**
+ * Distinguishes review failures that should retry on the next tick
+ * ("transient" — network, SDK throw, gh post failure) from failures that
+ * shouldn't ("permanent" — secret-scan refused the diff; re-fetching the
+ * same diff would produce the same refusal). Threaded into canAdvanceCursor
+ * so transient failures hold the cursor for retry, permanent ones don't.
+ */
+type ReviewFailureKind = "transient" | "permanent";
+
 type ExecOutcome =
   | {
       kind: "filed";
@@ -331,6 +340,7 @@ type ExecOutcome =
       curator_error?: string;
       review?: ReviewActionOutcome;
       review_error?: string;
+      review_error_kind?: ReviewFailureKind;
     }
   | { kind: "dropped" }
   | { kind: "security-held"; path: string }
@@ -419,7 +429,8 @@ async function runExecute(cfg: ConfigV2, state: State, opts: ExecOptions): Promi
         outcome.kind === "unimplemented" ||
         outcome.kind === "error" ||
         outcome.kind === "needs-triage" ||
-        (outcome.kind === "filed" && outcome.curator_error)
+        (outcome.kind === "filed" && outcome.curator_error) ||
+        (outcome.kind === "filed" && outcome.review_error_kind === "transient")
       ) {
         canAdvanceCursor = false;
       }
@@ -1033,11 +1044,14 @@ async function runPrReviewLane(args: {
   try {
     diff = fetchPullRequestDiff(args.source.slug, pr.number);
   } catch (e) {
+    // Transient — `gh pr diff` could fail on network/auth blips.
+    // Hold the cursor so the next tick retries; don't mark v2_seen.
     return {
       kind: "filed",
       ticket_ref: args.ticket_ref,
       labels_added: args.labels_added,
       review_error: `failed to fetch PR diff: ${(e as Error).message}`,
+      review_error_kind: "transient",
     };
   }
 
@@ -1068,6 +1082,7 @@ async function runPrReviewLane(args: {
       ticket_ref: args.ticket_ref,
       labels_added: args.labels_added,
       review_error: `diff secret-scan tripped (${scan.reason}); refusing to send diff to review-agent — review this PR manually`,
+      review_error_kind: "permanent",
     };
   }
 
@@ -1093,13 +1108,13 @@ async function runPrReviewLane(args: {
       cost_usd: out.cost_usd,
       posted: post.ok,
     };
-    args.state.updateV2SeenAfterCurator({
-      source_name: args.source.name,
-      external_id: args.item.external_id,
-      curator_decision: `review:${out.decision.verdict}`,
-      status: post.ok ? "reviewed" : "review-posted-failed",
-    });
     if (!post.ok) {
+      // Transient — the verdict was computed (LLM cost was paid) but the
+      // gh post hit a network/auth blip. Don't mark v2_seen; hold the
+      // cursor so the next tick retries. Re-running the LLM call burns
+      // another call, but the alternative is a silently un-reviewed PR.
+      // A future slice could cache the verdict between ticks to skip the
+      // LLM re-call on retry.
       log.warn("v2 review post failed", {
         slug: args.source.slug,
         number: pr.number,
@@ -1112,8 +1127,16 @@ async function runPrReviewLane(args: {
         labels_added: args.labels_added,
         review: outcome,
         review_error: `gh pr review post failed: ${post.error}`,
+        review_error_kind: "transient",
       };
     }
+    // Posted successfully — terminal happy path.
+    args.state.updateV2SeenAfterCurator({
+      source_name: args.source.name,
+      external_id: args.item.external_id,
+      curator_decision: `review:${out.decision.verdict}`,
+      status: "reviewed",
+    });
     return {
       kind: "filed",
       ticket_ref: args.ticket_ref,
@@ -1121,22 +1144,19 @@ async function runPrReviewLane(args: {
       review: outcome,
     };
   } catch (e) {
+    // Transient — SDK errors (network, rate-limit, model unavailable) are
+    // recoverable on a later tick. Hold the cursor; don't mark v2_seen.
     log.warn("v2 review-agent threw", {
       slug: args.source.slug,
       number: pr.number,
       error: (e as Error).message,
-    });
-    args.state.updateV2SeenAfterCurator({
-      source_name: args.source.name,
-      external_id: args.item.external_id,
-      curator_decision: "review:sdk-error",
-      status: "review-errored",
     });
     return {
       kind: "filed",
       ticket_ref: args.ticket_ref,
       labels_added: args.labels_added,
       review_error: (e as Error).message,
+      review_error_kind: "transient",
     };
   }
 }
