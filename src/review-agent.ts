@@ -120,11 +120,41 @@ export async function reviewPullRequest(args: {
   return { decision, cost_usd: cost };
 }
 
+/**
+ * Defense-in-depth secret scan over a PR diff. Mirrors the regex shapes
+ * `src/sinks/security.ts:redact` uses (token prefixes + PEM private-key
+ * blocks). NOT a full secret scanner — it catches the common, obvious
+ * shapes that show up in accidental commits. When this fires, the
+ * caller refuses to send the diff to the review-agent (and therefore
+ * to the Anthropic API). Items where the diff trips this gate are
+ * better off held for manual review than processed by an automated
+ * lane that would exfiltrate the secret to a third-party API.
+ *
+ * The "long hex" pattern from redact() is intentionally omitted here
+ * because diffs naturally contain long hex strings in their headers
+ * (commit SHAs, blob hashes) and would false-positive every diff.
+ */
+export function diffLikelyContainsSecrets(
+  diff: string,
+): { found: false } | { found: true; reason: string } {
+  if (/-----BEGIN [A-Z ]+PRIVATE KEY-----/.test(diff)) {
+    return { found: true, reason: "PEM private-key block" };
+  }
+  const tokenRe =
+    /\b(sk-[A-Za-z0-9_-]{16,}|ghp_[A-Za-z0-9]{20,}|gho_[A-Za-z0-9]{20,}|ghu_[A-Za-z0-9]{20,}|ghr_[A-Za-z0-9]{20,}|xox[bpars]-[A-Za-z0-9-]{10,})\b/;
+  const m = diff.match(tokenRe);
+  if (m) return { found: true, reason: `token-shaped string (prefix "${m[1].slice(0, 5)}…")` };
+  return { found: false };
+}
+
 function parseReviewJSON(text: string): ReviewDecision {
-  const trimmed = text.trim().replace(/^```(?:json)?\s*/, "").replace(/\s*```$/, "");
+  // The system prompt is explicit ("Output JSON ONLY", "no prose, no code
+  // fences"). If the model returns anything else, throw — matches the curator
+  // and triage parsers, which deliberately don't soft-rescue malformed output.
+  // A cleanup pass here would set a precedent other agents would copy.
   let parsed: unknown;
   try {
-    parsed = JSON.parse(trimmed);
+    parsed = JSON.parse(text.trim());
   } catch (e) {
     throw new Error(`review-agent returned non-JSON: ${(e as Error).message}\n--- raw ---\n${text}`);
   }

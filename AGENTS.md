@@ -67,14 +67,35 @@ role pipeline.
   `ANTHROPIC_API_KEY`. Either path is fine; both must be missing for
   triage to fail.
 
+## Boundary with oteam
+
+dispatch ingests external items into the vault. Lifecycle management
+(state transitions, role-pipeline phases, ticket archival) lives on the
+oteam side of the workspace. The one explicit exception is the
+`autopilot=review` tier on `github_prs` sources: after filing the PR
+ticket, dispatch fetches the PR diff, runs the review-agent, and posts
+the verdict back to GitHub via `gh pr review`. This crosses the
+"dispatch ends at the pull" line by design — PR review is an inherently
+external write-back action that doesn't fit oteam's role-pipeline model
+(no "phase advance" semantics, no AGT-NNN lifecycle). Treat it as a
+scoped exception; new code paths that want to write to external
+systems should be discussed before adopting this pattern.
+
+Diffs fetched for the review-agent are screened by an in-process
+secret-shape scan (`diffLikelyContainsSecrets`) BEFORE being sent to the
+Anthropic API. Diffs that trip the scan are refused; the ticket files
+but the verdict step is skipped. The scan only catches obvious shapes
+(token prefixes, PEM blocks); it's defense-in-depth, not a full secret
+scanner. Operators with stricter requirements should also configure
+secret-scanning in their CI pipeline.
+
 ## Out of scope
 
 - Running on Linux as a systemd unit. Possible later, not now.
 - Webhooks / push triggers. The 5-minute poll cadence is intentional and
   removes the need for a public endpoint.
-- Extending sinks beyond oteam (Linear, Notion, raw markdown). Could
-  happen if there's demand; today the abstraction is "vault file" and it
-  hard-requires `oteam`.
+- Inline (per-line) PR review comments. The review-agent posts a
+  top-level verdict only; per-line annotations are a separate slice.
 
 ## Related tools
 

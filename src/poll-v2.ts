@@ -24,7 +24,11 @@ import {
 import { holdItemForSecurityReview } from "./sinks/security.ts";
 import { fileLocalItemToVault, pullUrlIntoVault } from "./sinks/vault.ts";
 import { runLifecycle } from "./lifecycle.ts";
-import { reviewPullRequest, type ReviewVerdict } from "./review-agent.ts";
+import {
+  diffLikelyContainsSecrets,
+  reviewPullRequest,
+  type ReviewVerdict,
+} from "./review-agent.ts";
 import { findVaultTicketPath, readRecentVaultTickets } from "./vault-read.ts";
 import { archiveFolderItem, readFolder } from "./sources/folder.ts";
 import { readGitHubIssues } from "./sources/github_issues.ts";
@@ -1034,6 +1038,28 @@ async function runPrReviewLane(args: {
       ticket_ref: args.ticket_ref,
       labels_added: args.labels_added,
       review_error: `failed to fetch PR diff: ${(e as Error).message}`,
+    };
+  }
+
+  // Defense-in-depth: scan the diff for obvious secret shapes BEFORE
+  // sending it to the Anthropic API. The triage/security-flag gate runs
+  // on the PR's title+body via the issue API payload — diff content is
+  // fetched in a secondary call and never sees the gate. If the local
+  // regex detector flags a token or private key, refuse to send the diff;
+  // the ticket is still filed but the verdict step is skipped and the
+  // operator is expected to triage by hand.
+  const scan = diffLikelyContainsSecrets(diff);
+  if (scan.found) {
+    log.warn("v2 review-agent refused: diff secret-scan tripped", {
+      slug: args.source.slug,
+      number: pr.number,
+      reason: scan.reason,
+    });
+    return {
+      kind: "filed",
+      ticket_ref: args.ticket_ref,
+      labels_added: args.labels_added,
+      review_error: `diff secret-scan tripped (${scan.reason}); refusing to send diff to review-agent — review this PR manually`,
     };
   }
 

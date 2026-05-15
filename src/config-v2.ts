@@ -197,6 +197,42 @@ export function loadConfigV2(path: string): ConfigV2 {
     }
   }
 
+  // Cross-field: autopilot="review" is github_prs-only. Catch
+  // misconfiguration at validate time instead of waiting for the first
+  // poll tick to emit "unimplemented" per item.
+  for (const r of data.rule.ingest) {
+    if (r.do.autopilot !== "review") continue;
+    if (r.when.kind && r.when.kind !== "github_prs") {
+      throw new Error(
+        `ingest rule "${r.name}": autopilot="review" requires a github_prs source, ` +
+          `but when.kind = "${r.when.kind}"`,
+      );
+    }
+    if (r.when.source) {
+      const src = sources.find(s => s.name === r.when.source);
+      if (src && src.kind !== "github_prs") {
+        throw new Error(
+          `ingest rule "${r.name}": autopilot="review" requires a github_prs source, ` +
+            `but when.source = "${r.when.source}" is a ${src.kind} source`,
+        );
+      }
+    }
+    if (!r.when.kind && !r.when.source) {
+      throw new Error(
+        `ingest rule "${r.name}": autopilot="review" requires when.kind = "github_prs" ` +
+          `or when.source naming a github_prs source — otherwise the rule would match ` +
+          `non-PR sources, where review isn't implemented`,
+      );
+    }
+  }
+  if (data.default?.autopilot === "review") {
+    throw new Error(
+      `[default] autopilot = "review" is not supported — review is github_prs-only, ` +
+        `and [default] applies to any unmatched source. Move the review autopilot to a ` +
+        `specific [[rule.ingest]] block with when.kind = "github_prs" instead.`,
+    );
+  }
+
   // bot_identity is required when any rule (or [default]) sets do.autopilot to
   // "fire" or "drive". The curator's claim step writes assignees as that login
   // before the orchestrator spawns — empty identity = no claim = no spawn.
