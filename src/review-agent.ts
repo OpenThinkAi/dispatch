@@ -148,13 +148,19 @@ export function diffLikelyContainsSecrets(
 }
 
 function parseReviewJSON(text: string): ReviewDecision {
-  // The system prompt is explicit ("Output JSON ONLY", "no prose, no code
-  // fences"). If the model returns anything else, throw — matches the curator
-  // and triage parsers, which deliberately don't soft-rescue malformed output.
-  // A cleanup pass here would set a precedent other agents would copy.
+  // Match the existing curator + triage parser pattern: strip ```json fences
+  // if present before JSON.parse. The prompt asks for JSON-only output, but
+  // models occasionally wrap it anyway. The earlier curator/triage code
+  // already does this strip and it's the established project precedent;
+  // a previous review iteration removed the strip here on the assumption
+  // those parsers throw on fenced output, but they don't. Live test against
+  // claude-sonnet-4-6 confirmed the model returns fenced output for review
+  // even with explicit "no code fences" in the system prompt — keeping the
+  // strip is the operational reality, not a soft-rescue fallback.
+  const trimmed = text.trim().replace(/^```(?:json)?\s*/, "").replace(/\s*```$/, "");
   let parsed: unknown;
   try {
-    parsed = JSON.parse(text.trim());
+    parsed = JSON.parse(trimmed);
   } catch (e) {
     throw new Error(`review-agent returned non-JSON: ${(e as Error).message}\n--- raw ---\n${text}`);
   }

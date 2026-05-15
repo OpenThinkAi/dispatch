@@ -516,8 +516,23 @@ async function executeItem(
   cfg: ConfigV2,
 ): Promise<ExecOutcome> {
   const existing = state.getV2Seen(source.name, item.external_id);
+  // status="filed" alone is terminal ONLY when no autopilot lane was supposed
+  // to follow the file. For github_prs + autopilot=review, the file step runs
+  // first and marks status="filed", then the review-agent runs after. A
+  // transient review failure (network, SDK throw, gh post blip) leaves the
+  // row at "filed" with no curator_decision recorded — the next tick should
+  // retry the review lane, not short-circuit. So already-filed only triggers
+  // when the curator_decision was recorded (terminal pipeline) OR when the
+  // matched rule wouldn't have run anything after file.
   if (existing && existing.status === "filed") {
-    return { kind: "already-filed" };
+    const wouldRunPostFileLane =
+      source.kind === "github_prs" &&
+      plan.via !== "drop" &&
+      plan.action.autopilot === "review";
+    if (!wouldRunPostFileLane || existing.curator_decision) {
+      return { kind: "already-filed" };
+    }
+    // Fall through — re-enter the review lane to retry the post-file work.
   }
 
   if (plan.via === "drop") {
