@@ -28,16 +28,23 @@
 # ─── autopilot tiers (chosen per ingest rule via do.autopilot) ───
 # off          → file the ticket and stop. Awaits human action.
 # curate-only  → also run the curator (dedupe / hold / green-light).
-#                Green-lit tickets are not auto-fired.
+#                Green-lit tickets are not auto-fired. github_issues only.
 # fire         → curate AND, on green-light, autonomously fire
 #                `oteam assign` ONCE — drives the first phase only.
+#                github_issues only.
 # drive        → like fire, but lifecycle rules keep re-firing each
 #                phase advance until the ticket reaches a terminal
-#                vault state. Most autonomous tier.
+#                vault state. Most autonomous tier. github_issues only.
+# review       → file the PR ticket AND run the review-agent: fetch the
+#                diff, classify, post a top-level review verdict
+#                (approve / request-changes / comment) back to the PR via
+#                `gh pr review`. github_prs only.
 #
 # When a matched rule's `do.autopilot` is "fire" or "drive" and the
 # source kind is `github_issues`, dispatch claims the GH issue (sets
 # `assignees` to `defaults.bot_identity`) before invoking the orchestrator.
+# "review" doesn't claim the PR — multiple review agents posting verdicts
+# is acceptable; multiple orchestrators racing on the same ticket is not.
 
 [defaults]
 state_dir                          = "~/.local/state/dispatch"
@@ -119,13 +126,14 @@ do.project     = "roadmap"
 do.autopilot   = "off"
 do.add_labels  = ["from-dispatch"]
 
-# Inbound PRs auto-fire a review phase.
+# Inbound PRs: file as a ticket AND run the review-agent (fetches diff,
+# posts an approve / request-changes / comment verdict back to the PR).
 [[rule.ingest]]
-name           = "pr-reviews-fire"
+name           = "pr-auto-review"
 when.source    = "myapp-prs"
 do.vault       = "my-vault"
 do.project     = "active-prs"
-do.autopilot   = "fire"
+do.autopilot   = "review"
 
 # Notes dropped in the inbox folder become ideas. No curator, no fire.
 [[rule.ingest]]

@@ -61,6 +61,43 @@ export function fetchIssue(ref: string): GitHubIssue {
   return JSON.parse(r.stdout);
 }
 
+/**
+ * Fetch the unified diff for a PR via `gh pr diff`. Returns the raw diff
+ * text. Used by the review-agent autopilot before invoking the LLM.
+ */
+export function fetchPullRequestDiff(slug: string, number: number): string {
+  const r = gh(["pr", "diff", String(number), "--repo", slug]);
+  if (!r.ok) throw new Error(`gh pr diff failed for ${slug}#${number}: ${r.stderr}`);
+  return r.stdout;
+}
+
+/**
+ * Post a top-level pull-request review with one of three verdicts.
+ * GH requires the verdict-specific flag (--approve / --request-changes /
+ * --comment) plus an optional body.
+ */
+export function postPullRequestReview(args: {
+  slug: string;
+  number: number;
+  verdict: "approve" | "request-changes" | "comment";
+  body: string;
+}): { ok: true } | { ok: false; error: string } {
+  const verdictFlag =
+    args.verdict === "approve"
+      ? "--approve"
+      : args.verdict === "request-changes"
+        ? "--request-changes"
+        : "--comment";
+  const r = gh([
+    "pr", "review", String(args.number),
+    "--repo", args.slug,
+    verdictFlag,
+    "--body", args.body,
+  ]);
+  if (!r.ok) return { ok: false, error: r.stderr };
+  return { ok: true };
+}
+
 /** List open PRs sorted by most recently updated, capped at `perPage`. */
 export function listOpenPrs(slug: string, perPage = 25): GitHubPR[] {
   const r = gh([
