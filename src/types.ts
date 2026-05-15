@@ -1,6 +1,6 @@
-export type Autopilot = "off" | "curate-only" | "fire" | "drive";
+export type Autopilot = "off" | "curate-only" | "fire" | "drive" | "review";
 
-export const AUTOPILOT_VALUES: Autopilot[] = ["off", "curate-only", "fire", "drive"];
+export const AUTOPILOT_VALUES: Autopilot[] = ["off", "curate-only", "fire", "drive", "review"];
 
 export type RepoConfig = {
   slug: string;

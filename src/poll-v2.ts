@@ -8,7 +8,12 @@ import { createHash } from "node:crypto";
 import { configPath } from "./config.ts";
 import { loadConfigV2 } from "./config-v2.ts";
 import { curateTicket } from "./curator.ts";
-import { addLabels, claimIssue } from "./github.ts";
+import {
+  addLabels,
+  claimIssue,
+  fetchPullRequestDiff,
+  postPullRequestReview,
+} from "./github.ts";
 import { log } from "./log.ts";
 import { planIngest, type IngestPlan } from "./rules.ts";
 import {
@@ -19,6 +24,11 @@ import {
 import { holdItemForSecurityReview } from "./sinks/security.ts";
 import { fileLocalItemToVault, pullUrlIntoVault } from "./sinks/vault.ts";
 import { runLifecycle } from "./lifecycle.ts";
+import {
+  diffLikelyContainsSecrets,
+  reviewPullRequest,
+  type ReviewVerdict,
+} from "./review-agent.ts";
 import { findVaultTicketPath, readRecentVaultTickets } from "./vault-read.ts";
 import { archiveFolderItem, readFolder } from "./sources/folder.ts";
 import { readGitHubIssues } from "./sources/github_issues.ts";
@@ -306,6 +316,21 @@ type CuratorOutcome = {
   spawn?: SpawnOutcome;
 };
 
+type ReviewActionOutcome = {
+  verdict: ReviewVerdict;
+  cost_usd: number | null;
+  posted: boolean;
+};
+
+/**
+ * Distinguishes review failures that should retry on the next tick
+ * ("transient" — network, SDK throw, gh post failure) from failures that
+ * shouldn't ("permanent" — secret-scan refused the diff; re-fetching the
+ * same diff would produce the same refusal). Threaded into canAdvanceCursor
+ * so transient failures hold the cursor for retry, permanent ones don't.
+ */
+type ReviewFailureKind = "transient" | "permanent";
+
 type ExecOutcome =
   | {
       kind: "filed";
@@ -313,6 +338,9 @@ type ExecOutcome =
       labels_added: number;
       curator?: CuratorOutcome;
       curator_error?: string;
+      review?: ReviewActionOutcome;
+      review_error?: string;
+      review_error_kind?: ReviewFailureKind;
     }
   | { kind: "dropped" }
   | { kind: "security-held"; path: string }
@@ -401,7 +429,8 @@ async function runExecute(cfg: ConfigV2, state: State, opts: ExecOptions): Promi
         outcome.kind === "unimplemented" ||
         outcome.kind === "error" ||
         outcome.kind === "needs-triage" ||
-        (outcome.kind === "filed" && outcome.curator_error)
+        (outcome.kind === "filed" && outcome.curator_error) ||
+        (outcome.kind === "filed" && outcome.review_error_kind === "transient")
       ) {
         canAdvanceCursor = false;
       }
@@ -583,16 +612,23 @@ async function executeItem(
 
   // sink === "vault" from here on. All four source kinds now file to vault:
   //   github_issues — full pipeline (triage + curator + orchestrator)
-  //   github_prs    — autopilot=off only (PR-specific curator lane is later)
+  //   github_prs    — autopilot=off (file only) or "review" (file + run the
+  //                   review-agent and post the verdict back to GH)
   //   folder        — autopilot=off only, file via `oteam ticket new` + body
   //                   append (oteam owns the AGT-NNN allocation + frontmatter)
   //   linear        — autopilot=off only, same file-via-ticket-new path as
   //                   folder, with a `**Linear:** <url>` backlink prepended
   //                   to the body so the upstream issue stays linked
-  if (source.kind === "github_prs" && autopilot !== "off") {
+  if (source.kind === "github_prs" && autopilot !== "off" && autopilot !== "review") {
     return {
       kind: "unimplemented",
-      reason: `autopilot="${autopilot}" not implemented for github_prs yet (PR-specific curator lane is a separate slice)`,
+      reason: `autopilot="${autopilot}" not implemented for github_prs (only "off" and "review" are valid PR autopilots)`,
+    };
+  }
+  if (source.kind !== "github_prs" && autopilot === "review") {
+    return {
+      kind: "unimplemented",
+      reason: `autopilot="review" is only valid for github_prs sources, not ${source.kind}`,
     };
   }
   if (source.kind === "folder" && autopilot !== "off") {
@@ -758,6 +794,21 @@ async function executeItem(
     return { kind: "filed", ticket_ref: r.ref, labels_added: labelsAdded };
   }
 
+  // github_prs + autopilot=review → fetch diff, run review-agent, post the
+  // verdict back to GH as a PR review. Separate lane from the github_issues
+  // curator chain below (which doesn't apply to PRs).
+  if (source.kind === "github_prs" && autopilot === "review") {
+    return await runPrReviewLane({
+      item,
+      source,
+      cfg,
+      state,
+      plan,
+      ticket_ref: r.ref,
+      labels_added: labelsAdded,
+    });
+  }
+
   // autopilot in {curate-only, fire, drive} → run curator, apply decision.
   // For "fire"/"drive" + curator-fire, fireOrchestrator claims the GH issue
   // and spawns oteam-assign; for "curate-only" + curator-fire we just record
@@ -855,13 +906,18 @@ async function executeItem(
       } else {
         // autopilot=fire or drive — claim + spawn orchestrator. Reuses the
         // issueNumber computed above for the gh-comment/hold branches.
+        // The curator branch is only reachable for github_issues with
+        // autopilot in {curate-only, fire, drive} — review returned early
+        // via runPrReviewLane and curate-only goes through the green-lit
+        // path above. Cast the autopilot to the narrowed union so the
+        // fireOrchestrator signature matches.
         const spawn = await fireOrchestrator({
           slug: issueSource.slug,
           number: issueNumber,
           botIdentity: cfg.defaults.bot_identity,
           ticketPath,
           logDir: cfg.defaults.log_dir,
-          autopilot,
+          autopilot: autopilot as "fire" | "drive",
         });
         curator.spawn = spawn;
         recordSpawnOutcome(state, source.name, item.external_id, spawn);
@@ -967,6 +1023,144 @@ function recordSpawnOutcome(
   }
 }
 
+/**
+ * github_prs + autopilot=review path: fetch the PR diff, run the review-agent,
+ * post the verdict back to GH. Returns a "filed" ExecOutcome enriched with
+ * the review action's verdict + cost + posted status. Diff-fetch failures
+ * and reviewer SDK failures land in `review_error`; gh post failures land
+ * in `review_error` too but the verdict still records as the local outcome.
+ */
+async function runPrReviewLane(args: {
+  item: Item;
+  source: Extract<SourceConfig, { kind: "github_prs" }>;
+  cfg: ConfigV2;
+  state: State;
+  plan: IngestPlan;
+  ticket_ref: string | null;
+  labels_added: number;
+}): Promise<ExecOutcome> {
+  const pr = args.item.raw as GitHubPR;
+  let diff: string;
+  try {
+    diff = fetchPullRequestDiff(args.source.slug, pr.number);
+  } catch (e) {
+    // Transient — `gh pr diff` could fail on network/auth blips.
+    // Hold the cursor so the next tick retries; don't mark v2_seen.
+    return {
+      kind: "filed",
+      ticket_ref: args.ticket_ref,
+      labels_added: args.labels_added,
+      review_error: `failed to fetch PR diff: ${(e as Error).message}`,
+      review_error_kind: "transient",
+    };
+  }
+
+  // Defense-in-depth: scan the diff for obvious secret shapes BEFORE
+  // sending it to the Anthropic API. The triage/security-flag gate runs
+  // on the PR's title+body via the issue API payload — diff content is
+  // fetched in a secondary call and never sees the gate. If the local
+  // regex detector flags a token or private key, refuse to send the diff;
+  // the ticket is still filed but the verdict step is skipped. Record
+  // the refusal in v2_seen so it's visible in audit and so subsequent
+  // ticks know the refusal already happened (cursor still advances —
+  // this is a content-based PERMANENT gate, not a transient failure).
+  const scan = diffLikelyContainsSecrets(diff);
+  if (scan.found) {
+    log.warn("v2 review-agent refused: diff secret-scan tripped", {
+      slug: args.source.slug,
+      number: pr.number,
+      reason: scan.reason,
+    });
+    args.state.updateV2SeenAfterCurator({
+      source_name: args.source.name,
+      external_id: args.item.external_id,
+      curator_decision: "review:refused-secret-scan",
+      status: "review-refused-secret-scan",
+    });
+    return {
+      kind: "filed",
+      ticket_ref: args.ticket_ref,
+      labels_added: args.labels_added,
+      review_error: `diff secret-scan tripped (${scan.reason}); refusing to send diff to review-agent — review this PR manually`,
+      review_error_kind: "permanent",
+    };
+  }
+
+  let outcome: ReviewActionOutcome;
+  try {
+    const out = await reviewPullRequest({
+      slug: args.source.slug,
+      number: pr.number,
+      title: pr.title,
+      body: pr.body ?? "",
+      diff,
+      model: args.cfg.defaults.curator_model,
+      perCallMaxBudgetUsd: args.cfg.defaults.per_call_max_budget_usd,
+    });
+    const post = postPullRequestReview({
+      slug: args.source.slug,
+      number: pr.number,
+      verdict: out.decision.verdict,
+      body: out.decision.body,
+    });
+    outcome = {
+      verdict: out.decision.verdict,
+      cost_usd: out.cost_usd,
+      posted: post.ok,
+    };
+    if (!post.ok) {
+      // Transient — the verdict was computed (LLM cost was paid) but the
+      // gh post hit a network/auth blip. Don't mark v2_seen; hold the
+      // cursor so the next tick retries. Re-running the LLM call burns
+      // another call, but the alternative is a silently un-reviewed PR.
+      // A future slice could cache the verdict between ticks to skip the
+      // LLM re-call on retry.
+      log.warn("v2 review post failed", {
+        slug: args.source.slug,
+        number: pr.number,
+        verdict: out.decision.verdict,
+        error: post.error,
+      });
+      return {
+        kind: "filed",
+        ticket_ref: args.ticket_ref,
+        labels_added: args.labels_added,
+        review: outcome,
+        review_error: `gh pr review post failed: ${post.error}`,
+        review_error_kind: "transient",
+      };
+    }
+    // Posted successfully — terminal happy path.
+    args.state.updateV2SeenAfterCurator({
+      source_name: args.source.name,
+      external_id: args.item.external_id,
+      curator_decision: `review:${out.decision.verdict}`,
+      status: "reviewed",
+    });
+    return {
+      kind: "filed",
+      ticket_ref: args.ticket_ref,
+      labels_added: args.labels_added,
+      review: outcome,
+    };
+  } catch (e) {
+    // Transient — SDK errors (network, rate-limit, model unavailable) are
+    // recoverable on a later tick. Hold the cursor; don't mark v2_seen.
+    log.warn("v2 review-agent threw", {
+      slug: args.source.slug,
+      number: pr.number,
+      error: (e as Error).message,
+    });
+    return {
+      kind: "filed",
+      ticket_ref: args.ticket_ref,
+      labels_added: args.labels_added,
+      review_error: (e as Error).message,
+      review_error_kind: "transient",
+    };
+  }
+}
+
 function contentHash(item: Item): string {
   return createHash("sha256")
     .update(item.title + "\n---\n" + item.body)
@@ -985,6 +1179,14 @@ function formatOutcome(o: ExecOutcome): string {
       }
       if (o.curator_error) {
         return `${ref}${labels}  curator ERROR: ${o.curator_error}`;
+      }
+      if (o.review) {
+        const cost = o.review.cost_usd !== null ? ` cost=$${o.review.cost_usd.toFixed(4)}` : "";
+        const post = o.review.posted ? "" : " (post failed)";
+        return `${ref}${labels}  review: ${o.review.verdict}${cost}${post}`;
+      }
+      if (o.review_error) {
+        return `${ref}${labels}  review ERROR: ${o.review_error}`;
       }
       return `${ref}${labels}`;
     }
