@@ -61,11 +61,24 @@ role pipeline.
   the user switches node versions via nvm (and `oteam` sits under
   `~/.nvm/...`), or moves any of `bun`/`gh`/`claude`/`oteam` to a different
   prefix, re-run `dispatch setup --force` to regenerate the plist.
-- The triage call uses `@anthropic-ai/claude-agent-sdk`, which spawns the
-  `claude` binary as a subprocess in headless mode. That subprocess uses
-  Claude Code's OAuth login if available, falling back to
-  `ANTHROPIC_API_KEY`. Either path is fine; both must be missing for
-  triage to fail.
+- The triage / curator / review-agent calls use
+  `@anthropic-ai/claude-agent-sdk`, which spawns the `claude` binary as a
+  subprocess in headless mode. **Precedence: `ANTHROPIC_API_KEY` wins over
+  a Claude Code OAuth login when both are present.** Set the env var (in
+  the launchd plist's `EnvironmentVariables` block, or inline for manual
+  runs) to bill dispatch's calls to a specific project-scoped API key and
+  decouple them from your interactive Claude Code usage. Verified
+  empirically against `claude-agent-sdk` ~0.2.129 on 2026-05-16 — Anthropic
+  docs don't pin this down explicitly, so re-verify if the SDK is bumped.
+  Both auth paths must be missing for the call to fail.
+
+- **June 15 2026 billing change**: Agent SDK / `claude -p` calls on
+  subscription plans now draw from a separate monthly credit pool
+  (Pro: $20, Max 5x: $100, Max 20x: $200; no rollover). API-key users
+  (Console pay-as-you-go) are unaffected. Operators running dispatch under
+  an OAuth subscription should expect the agent traffic to eat into that
+  pool starting June 15; setting `ANTHROPIC_API_KEY` per the note above
+  routes around it.
 
 ## Boundary with oteam
 
